@@ -1,0 +1,25 @@
+# Dump what the Metal 4 TensorOps (MetalPerformancePrimitives) headers accept,
+# to decide which precision combinations are native (fork-only).
+name: TensorOps info
+
+on:
+  workflow_dispatch:
+
+jobs:
+  info:
+    if: github.repository == 'ain-soph/mlx'
+    runs-on: macos-26
+    steps:
+      - name: Headers
+        run: |
+          xcodebuild -showComponent MetalToolchain || xcodebuild -downloadComponent MetalToolchain
+          TC=$(dirname $(dirname $(xcrun -sdk macosx -f metal)))
+          echo "toolchain: $TC"
+          H=$(find "$TC" /Applications/Xcode*.app -path "*MetalPerformancePrimitives*" -name "*.h" 2>/dev/null | sort -u)
+          echo "$H"
+          for f in $H; do echo "===== $f"; grep -n -i -E "int8|uint8|half|bfloat|float8|e4m3|e5m2|int4|fp4|int32|static_assert|is_same|enable_if|reduced_precision|accum" "$f" | head -200; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mpp-headers
+          path: /tmp/mpp
+          if-no-files-found: ignore
