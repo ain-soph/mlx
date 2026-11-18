@@ -4,9 +4,10 @@
 > |---|---|---|---|
 > | Zero-copy safetensors loading | map weights from the page cache instead of copying them | `mx.load(path, zero_copy=True)` or `MLX_ZERO_COPY_LOAD=1` (off) | reranker 4B: load 0.62 → 0.32 s, footprint after load 8.11 → 0.44 GB; bit-identical scores |
 > | `mx.SafetensorsFile` handle and `mx.load(path, keys=[...])` | map a file once and read single tensors on demand (per-layer streaming in mflux, h3-image-mlx) | `mx.SafetensorsFile(path, zero_copy=True)`; `keys=` on `mx.load` | replaces the downstream mmap code; regress 44 PASS before and after |
+> | ConvRot W8A8 in `mx.fast`: `convrot_quantize`, `convrot_quantize_weight`, `convrot_matmul`, `convrot_matmul_quantized` | one copy of the Hadamard-256 rotate-quantize and INT8 TensorOps GEMM kernels instead of three downstream copies (mflux, h3-image-mlx, llm-serving) | call the functions; float fallback without TensorOps (CPU, non-M5) | same bytes and speed as the old copies (e.g. 4096×3072×12288 2.095 → 2.080 ms); regress 55 PASS before and after |
 > | Page-aligned safetensors saving, dict order kept | lets tensors start on a page so they can be mapped | `mx.save_safetensors(..., page_align=True)` (off) | still a standard safetensors file |
 > | GPU buffer cache cap from the environment | the cache can grow to the memory limit and stays resident | `MLX_CACHE_LIMIT_MB=<MiB>` (unset = default) | 256 MiB: cache after a request 873 → 309 MB; same scores |
-> | Fork wheels built by CI (`serving-wheels.yml`), local version label | the serving machine has no Metal compiler | `MLX_LOCAL_VERSION` | `0.32.4+serving.<hash>`; regress 52 PASS before and after the switch |
+> | Fork wheels on GitHub Releases (`serving-<version>-<hash>`), local version label | the serving environment installs MLX from a pinned wheel | `MLX_LOCAL_VERSION` | `0.32.4+serving.<hash>` (CI- or locally built, stated in each release); regress 52 PASS before and after the switch |
 >
 > Full numbers: [MLX fork in ain-soph/llm-serving](https://github.com/ain-soph/llm-serving/blob/main/docs/performance.md#运行时mlx-forkain-sophmlx-serving). Upstream PRs: none yet (to be filed by the fork owner).
 
