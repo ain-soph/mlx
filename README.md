@@ -1,3 +1,14 @@
+> **ain-soph fork (`serving` branch), based on upstream v0.32.4.** What differs from upstream:
+>
+> | Change | Why | Enable / default | Effect (M5 Ultra) |
+> |---|---|---|---|
+> | Zero-copy safetensors loading | weights map from the page cache instead of being copied into new buffers; idle processes hold no copy, processes share one | `mx.load(path, zero_copy=True)` or `MLX_ZERO_COPY_LOAD=1` (off) | reranker 4B process footprint after load 8.15 → 0.30 GB; identical outputs |
+> | Page-aligned safetensors saving, dict order kept | lets tensors start on a page so they can be mapped | `mx.save_safetensors(..., page_align=True)` (off) | still a standard safetensors file |
+> | GPU buffer cache cap from the environment | the default cache may grow to the memory limit, and cached buffers stay resident | `MLX_CACHE_LIMIT_MB=<MiB>` (unset = default) | e.g. diffusion VAE caches of 35–78 GB capped without code changes |
+> | Fork wheels built by CI (`serving-wheels.yml`), local version label | the serving machine has no Metal compiler | `MLX_LOCAL_VERSION` | `0.32.4+serving.<hash>` |
+>
+> Measurements: [llm-serving `docs/performance.md`](https://github.com/ain-soph/llm-serving/blob/main/docs/performance.md) · design and status: `reports/mlx-fork.md` in the serving setup. Upstream PRs: none yet (MLX asks for posts in the author's own words; the owner of this fork will file them).
+
 # MLX
 
 [**Quickstart**](#quickstart) | [**Installation**](#installation) |
