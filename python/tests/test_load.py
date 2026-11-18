@@ -685,6 +685,51 @@ class TestLoad(mlx_tests.MLXTestCase):
         self.assertTrue(mx.array_equal(y * 2, x * 2))
         del y
 
+    def test_load_keys(self):
+        arrays = {"a": mx.arange(10), "b": mx.ones((4, 4)), "c": mx.zeros((2,))}
+        path = os.path.join(self.test_dir, "keys.safetensors")
+        mx.save_safetensors(path, arrays, {"m": "1"})
+        for zero_copy in (False, True):
+            loaded, metadata = mx.load(path, return_metadata=True, keys=["c", "a"], zero_copy=zero_copy)
+            self.assertEqual(set(loaded), {"a", "c"})
+            self.assertEqual(metadata, {"m": "1"})
+            self.assertTrue(mx.array_equal(loaded["a"], arrays["a"]))
+        with self.assertRaises(ValueError):
+            mx.load(path, keys=["missing"])
+        with self.assertRaises(ValueError):
+            mx.load(path, format="npz", keys=["a"])
+
+    def test_safetensors_file(self):
+        page = os.sysconf("SC_PAGE_SIZE")
+        q = mx.random.normal((page // 8, 4)).astype(mx.float16)
+        k = mx.random.normal((page // 8, 4)).astype(mx.float16)
+        v = mx.random.normal((page // 4, 4)).astype(mx.float16)
+        norm = mx.ones((4,))
+        path = os.path.join(self.test_dir, "handle.safetensors")
+        mx.save_safetensors(path, {"q": q, "k": k, "v": v, "norm": norm}, {"x": "y"}, page_align=True)
+        for zero_copy in (False, True):
+            f = mx.SafetensorsFile(path, zero_copy=zero_copy)
+            self.assertEqual(f.keys(), ["q", "k", "v", "norm"])
+            self.assertEqual(len(f), 4)
+            self.assertIn("v", f)
+            self.assertNotIn("w", f)
+            self.assertEqual(f.metadata(), {"x": "y"})
+            for name, ref in (("q", q), ("k", k), ("v", v), ("norm", norm)):
+                self.assertTrue(mx.array_equal(f[name], ref))
+            with self.assertRaises(ValueError):
+                f["w"]
+            rows = f.get_rows(["q", "k", "v"])
+            if f.mapped:
+                self.assertTrue(mx.array_equal(rows, mx.concatenate([q, k, v])))
+            else:
+                self.assertIsNone(rows)
+            self.assertIsNone(f.get_rows(["k", "q"]))      # not in file order
+            self.assertIsNone(f.get_rows(["v", "norm"]))   # different trailing shape
+            # arrays outlive the handle
+            x = f["q"]
+            del f
+            self.assertTrue(mx.array_equal(x, q))
+
 
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner()

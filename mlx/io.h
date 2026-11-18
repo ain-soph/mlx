@@ -2,8 +2,10 @@
 
 #pragma once
 
+#include <optional>
 #include <unordered_map>
 #include <variant>
+#include <vector>
 
 #include "mlx/api.h"
 #include "mlx/array.h"
@@ -49,6 +51,46 @@ MLX_API SafetensorsLoad load_safetensors(
     const std::string& file,
     bool zero_copy,
     StreamOrDevice s = {});
+/** Default for zero_copy: the MLX_ZERO_COPY_LOAD environment variable. */
+MLX_API bool zero_copy_load_default();
+
+/** As above, loading only the given tensors (all when keys is empty). */
+MLX_API SafetensorsLoad load_safetensors(
+    const std::string& file,
+    bool zero_copy,
+    const std::optional<std::vector<std::string>>& keys,
+    StreamOrDevice s = {});
+
+/**
+ * An open .safetensors file: the header is read once and, with zero_copy, the
+ * file is mapped once; get() then returns one tensor at a time (mapped when it
+ * starts on a page, else loaded lazily). For code that creates and drops the
+ * arrays of a layer per use (streaming weights), so that only the arrays in use
+ * are alive, and hence resident, while the GPU works.
+ */
+class MLX_API SafetensorsFile {
+ public:
+  SafetensorsFile(
+      const std::string& file,
+      bool zero_copy,
+      StreamOrDevice s = {});
+  const std::vector<std::string>& keys() const;
+  const std::unordered_map<std::string, std::string>& metadata() const;
+  bool contains(const std::string& key) const;
+  /** Whether any tensor of the file can be mapped (zero_copy and aligned). */
+  bool mapped() const;
+  array get(const std::string& key) const;
+  /**
+   * The row-wise concatenation of the given tensors as one mapped array when
+   * they lie back to back in the file in this order with the same dtype and
+   * trailing dimensions (e.g. packed Q/K/V projections); nullopt otherwise.
+   */
+  std::optional<array> get_rows(const std::vector<std::string>& keys) const;
+
+ private:
+  struct Impl;
+  std::shared_ptr<Impl> impl_;
+};
 
 MLX_API void save_safetensors(
     std::shared_ptr<io::Writer> in_stream,

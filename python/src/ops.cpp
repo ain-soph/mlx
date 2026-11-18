@@ -5,6 +5,7 @@
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
+#include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
@@ -14,6 +15,7 @@
 #include <variant>
 
 #include "mlx/einsum.h"
+#include "mlx/io.h"
 #include "mlx/ops.h"
 #include "mlx/utils.h"
 #include "python/src/convert.h"
@@ -4601,6 +4603,70 @@ void init_ops(nb::module_& m) {
             **kwargs (arrays): Arrays to be saved. Each array will be saved
               with the associated keyword as the output file name.
       )pbdoc");
+  nb::class_<mx::SafetensorsFile>(
+      m,
+      "SafetensorsFile",
+      R"pbdoc(
+        An open ``.safetensors`` file that returns one tensor at a time.
+
+        The header is read once and, with ``zero_copy``, the file is mapped
+        once; each lookup then returns a tensor mapped from the file when it
+        starts on a page boundary (see ``page_align`` in
+        :func:`save_safetensors`), or loaded lazily otherwise. Code that
+        creates and drops a layer's arrays around each use keeps only those
+        arrays alive, and hence resident, while the GPU works.
+
+        Args:
+            file (str, pathlib.Path): Path of the ``.safetensors`` file.
+            zero_copy (bool, optional): Map page-aligned tensors. If ``None``,
+              the ``MLX_ZERO_COPY_LOAD`` environment variable decides.
+              Default: ``None``.
+      )pbdoc")
+      .def(
+          "__init__",
+          [](mx::SafetensorsFile* self,
+             nb::object file,
+             std::optional<bool> zero_copy,
+             mx::StreamOrDevice s) {
+            auto path = nb::cast<std::string>(nb::str(file));
+            new (self) mx::SafetensorsFile(
+                path, zero_copy.value_or(mx::zero_copy_load_default()), s);
+          },
+          "file"_a,
+          "zero_copy"_a = nb::none(),
+          nb::kw_only(),
+          "stream"_a = nb::none(),
+          nb::sig(
+              "def __init__(self, file: str | pathlib.Path, zero_copy: bool | None = None, *, stream: StreamOrDevice = None) -> None"))
+      .def(
+          "keys",
+          [](const mx::SafetensorsFile& f) { return f.keys(); },
+          "Tensor names in file order.")
+      .def(
+          "metadata",
+          [](const mx::SafetensorsFile& f) { return f.metadata(); },
+          "The ``__metadata__`` dictionary.")
+      .def_prop_ro(
+          "mapped",
+          &mx::SafetensorsFile::mapped,
+          "Whether tensors of this file are mapped (zero-copy).")
+      .def("__contains__", &mx::SafetensorsFile::contains)
+      .def(
+          "__len__",
+          [](const mx::SafetensorsFile& f) { return f.keys().size(); })
+      .def("__getitem__", &mx::SafetensorsFile::get, "key"_a)
+      .def(
+          "get_rows",
+          &mx::SafetensorsFile::get_rows,
+          "keys"_a,
+          nb::sig(
+              "def get_rows(self, keys: Sequence[str]) -> array | None"),
+          R"pbdoc(
+            The row-wise concatenation of the given tensors as one mapped
+            array, when they lie back to back in the file in this order with
+            the same dtype and trailing dimensions (e.g. Q, K and V
+            projections written next to each other); ``None`` otherwise.
+          )pbdoc");
   m.def(
       "load",
       &mlx_load_helper,
@@ -4609,9 +4675,10 @@ void init_ops(nb::module_& m) {
       "return_metadata"_a = false,
       nb::kw_only(),
       "zero_copy"_a = nb::none(),
+      "keys"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def load(file: file | str | pathlib.Path, /, format: str | None = None, return_metadata: bool = False, *, zero_copy: bool | None = None, stream: StreamOrDevice = None) -> array | dict[str, array] | tuple[dict[str, array], dict[str, Any]]"),
+          "def load(file: file | str | pathlib.Path, /, format: str | None = None, return_metadata: bool = False, *, zero_copy: bool | None = None, keys: Sequence[str] | None = None, stream: StreamOrDevice = None) -> array | dict[str, array] | tuple[dict[str, array], dict[str, Any]]"),
       R"pbdoc(
         Load array(s) from a binary file.
 
@@ -4634,6 +4701,10 @@ void init_ops(nb::module_& m) {
               and an idle process holds no copy of them. Other tensors load
               as usual. If ``None``, the ``MLX_ZERO_COPY_LOAD`` environment
               variable decides. Default: ``None``.
+            keys (Sequence[str], optional): For a ``.safetensors`` file given
+              by path: load only these tensors. To load a few tensors many
+              times (e.g. one layer at a time), use :class:`SafetensorsFile`,
+              which reads the header and maps the file once. Default: ``None``.
         Returns:
             array, dict, or tuple:
                 A single array if loading from a ``.npy`` file or a dict

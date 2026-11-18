@@ -186,14 +186,20 @@ std::pair<
 mlx_load_safetensor_helper(
     nb::object file,
     mx::StreamOrDevice s,
-    std::optional<bool> zero_copy) {
+    std::optional<bool> zero_copy,
+    std::optional<std::vector<std::string>> keys) {
   if (is_str_or_path(file)) { // Assume .safetensors file path string
     auto file_str = nb::cast<std::string>(nb::str(file));
-    if (zero_copy.has_value()) {
-      return mx::load_safetensors(file_str, zero_copy.value(), s);
+    if (zero_copy.has_value() || keys.has_value()) {
+      return mx::load_safetensors(
+          file_str, zero_copy.value_or(mx::zero_copy_load_default()), keys, s);
     }
     return mx::load_safetensors(file_str, s);
   } else if (is_istream_object(file)) {
+    if (keys.has_value()) {
+      throw std::invalid_argument(
+          "[load_safetensors] keys requires a file path, not a file object");
+    }
     // If we don't own the stream and it was passed to us, eval immediately
     auto res = mx::load_safetensors(std::make_shared<PyFileReader>(file), s);
     {
@@ -283,6 +289,7 @@ LoadOutputTypes mlx_load_helper(
     std::optional<std::string> format,
     bool return_metadata,
     std::optional<bool> zero_copy,
+    std::optional<std::vector<std::string>> keys,
     mx::StreamOrDevice s) {
   if (!format.has_value()) {
     std::string fname;
@@ -302,12 +309,17 @@ LoadOutputTypes mlx_load_helper(
     format.emplace(fname.substr(ext + 1));
   }
 
+  if (keys.has_value() && format.value() != "safetensors") {
+    throw std::invalid_argument(
+        "[load] keys is supported for safetensors only, not " + format.value());
+  }
   if (return_metadata && (format.value() == "npy" || format.value() == "npz")) {
     throw std::invalid_argument(
         "[load] metadata not supported for format " + format.value());
   }
   if (format.value() == "safetensors") {
-    auto [dict, metadata] = mlx_load_safetensor_helper(file, s, zero_copy);
+    auto [dict, metadata] =
+        mlx_load_safetensor_helper(file, s, zero_copy, keys);
     if (return_metadata) {
       return std::make_pair(dict, metadata);
     }

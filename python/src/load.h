@@ -26,7 +26,8 @@ using LoadOutputTypes = std::variant<
 mx::SafetensorsLoad mlx_load_safetensor_helper(
     nb::object file,
     mx::StreamOrDevice s,
-    std::optional<bool> zero_copy = std::nullopt);
+    std::optional<bool> zero_copy = std::nullopt,
+    std::optional<std::vector<std::string>> keys = std::nullopt);
 void mlx_save_safetensor_helper(
     nb::object file,
     nb::dict d,
@@ -45,6 +46,7 @@ LoadOutputTypes mlx_load_helper(
     std::optional<std::string> format,
     bool return_metadata,
     std::optional<bool> zero_copy,
+    std::optional<std::vector<std::string>> keys,
     mx::StreamOrDevice s);
 void mlx_save_helper(nb::object file, mx::array a);
 void mlx_savez_helper(

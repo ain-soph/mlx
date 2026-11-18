@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <json.hpp>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stack>
 
@@ -240,19 +241,21 @@ array lazy_load(
       std::vector<array>{});
 }
 
-#ifndef _WIN32
 /** A read-only mapping of a whole file, unmapped with its last array */
 struct FileMapping {
-  void* ptr{MAP_FAILED};
+  void* ptr{nullptr};
   size_t size{0};
   ~FileMapping() {
-    if (ptr != MAP_FAILED) {
+#ifndef _WIN32
+    if (ptr != nullptr) {
       munmap(ptr, size);
     }
+#endif
   }
 };
 
 std::shared_ptr<FileMapping> map_file(const std::string& file) {
+#ifndef _WIN32
   int fd = open(file.c_str(), O_RDONLY);
   if (fd < 0) {
     return nullptr;
@@ -260,16 +263,18 @@ std::shared_ptr<FileMapping> map_file(const std::string& file) {
   auto mapping = std::make_shared<FileMapping>();
   off_t size = lseek(fd, 0, SEEK_END);
   if (size > 0) {
-    mapping->size = static_cast<size_t>(size);
-    mapping->ptr = mmap(nullptr, mapping->size, PROT_READ, MAP_SHARED, fd, 0);
+    void* ptr = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+    if (ptr != MAP_FAILED) {
+      mapping->ptr = ptr;
+      mapping->size = static_cast<size_t>(size);
+    }
   }
   close(fd);
-  if (mapping->ptr == MAP_FAILED) {
-    return nullptr;
-  }
-  return mapping;
-}
+  return mapping->ptr ? mapping : nullptr;
+#else
+  return nullptr;
 #endif
+}
 
 } // namespace
 
@@ -287,67 +292,202 @@ SafetensorsLoad load_safetensors(
   return {res, std::move(header.metadata)};
 }
 
-SafetensorsLoad
-load_safetensors(const std::string& file, bool zero_copy, StreamOrDevice s) {
-  auto in_stream = std::make_shared<io::ParallelFileReader>(file);
-  if (!zero_copy) {
-    return load_safetensors(in_stream, s);
-  }
-  auto stream = cu::is_available() ? to_stream(s) : to_stream(s, Device::cpu);
-  auto header = read_safetensors_header(*in_stream);
+namespace {
 
-  // A tensor that starts on a page boundary is mapped instead of read; the
-  // GPU then reads it straight from the page cache. Metal wraps only whole
-  // pages, so the mapped range is rounded up to a page (the file must extend
-  // that far; what lies past the tensor is never read). Other tensors, and
-  // every tensor when the allocator cannot wrap the memory, load as usual.
-  std::unordered_map<std::string, array> res;
+/** A mapped array over [offset, offset + nbytes) of the mapping, or nullopt */
+std::optional<array> map_array(
+    const std::shared_ptr<FileMapping>& mapping,
+    size_t offset,
+    size_t nbytes,
+    Dtype type,
+    const Shape& shape) {
 #ifndef _WIN32
+  // Metal wraps only whole pages, so the mapped range is rounded up to a page
+  // (the file must extend that far; what lies past the tensor is never read).
   const size_t page = static_cast<size_t>(getpagesize());
-  std::shared_ptr<FileMapping> mapping;
-  for (const auto& t : header.tensors) {
-    if (t.nbytes > 0 && t.begin % page == 0) {
-      mapping = map_file(file);
-      break;
-    }
+  size_t padded = (nbytes + page - 1) / page * page;
+  if (!mapping || nbytes == 0 || offset % page != 0 ||
+      offset + padded > mapping->size) {
+    return std::nullopt;
   }
+  auto ptr = static_cast<char*>(mapping->ptr) + offset;
+  auto buffer = allocator::make_buffer(ptr, padded);
+  if (buffer.ptr() == nullptr) {
+    return std::nullopt;
+  }
+  array out(shape, type, nullptr, {});
+  Strides strides(shape.size(), 1);
+  for (int i = static_cast<int>(shape.size()) - 2; i >= 0; --i) {
+    strides[i] = strides[i + 1] * shape[i + 1];
+  }
+  auto [no_bsx_size, row_contiguous, col_contiguous] =
+      check_contiguity(shape, strides);
+  // The deleter holds the mapping until the last mapped array is freed.
+  out.set_data(
+      allocator::Data(
+          buffer, [mapping](allocator::Buffer b) { allocator::release(b); }),
+      nbytes / type.size(),
+      std::move(strides),
+      array::Flags{true, row_contiguous, col_contiguous});
+  out.set_status(array::Status::available);
+  return out;
+#else
+  return std::nullopt;
 #endif
-  for (const auto& t : header.tensors) {
+}
+
+} // namespace
+
+struct SafetensorsFile::Impl {
+  std::string file;
+  std::shared_ptr<io::Reader> in_stream;
+  Stream stream;
+  std::vector<std::string> keys;
+  std::unordered_map<std::string, TensorEntry> tensors;
+  std::unordered_map<std::string, std::string> metadata;
+  std::shared_ptr<FileMapping> mapping;
+
+  Impl(const std::string& f, bool zero_copy, StreamOrDevice s)
+      : file(f),
+        in_stream(std::make_shared<io::ParallelFileReader>(f)),
+        stream(
+            cu::is_available() ? to_stream(s) : to_stream(s, Device::cpu)) {
+    auto header = read_safetensors_header(*in_stream);
+    metadata = std::move(header.metadata);
+    // File order (the JSON header itself is not ordered)
+    std::stable_sort(
+        header.tensors.begin(),
+        header.tensors.end(),
+        [](const auto& a, const auto& b) { return a.begin < b.begin; });
+    for (auto& t : header.tensors) {
+      keys.push_back(t.key);
+      tensors.insert({t.key, std::move(t)});
+    }
 #ifndef _WIN32
-    size_t padded = (t.nbytes + page - 1) / page * page;
-    if (mapping && t.nbytes > 0 && t.begin % page == 0 &&
-        t.begin + padded <= mapping->size) {
-      auto ptr = static_cast<char*>(mapping->ptr) + t.begin;
-      auto buffer = allocator::make_buffer(ptr, padded);
-      if (buffer.ptr() != nullptr) {
-        array out(t.shape, t.type, nullptr, {});
-        Strides strides(t.shape.size(), 1);
-        for (int i = static_cast<int>(t.shape.size()) - 2; i >= 0; --i) {
-          strides[i] = strides[i + 1] * t.shape[i + 1];
+    if (zero_copy) {
+      const size_t page = static_cast<size_t>(getpagesize());
+      for (const auto& [k, t] : tensors) {
+        if (t.nbytes > 0 && t.begin % page == 0) {
+          mapping = map_file(file);
+          break;
         }
-        auto [no_bsx_size, row_contiguous, col_contiguous] =
-            check_contiguity(t.shape, strides);
-        // The deleter holds the mapping until the last mapped array is freed.
-        out.set_data(
-            allocator::Data(
-                buffer,
-                [mapping](allocator::Buffer b) { allocator::release(b); }),
-            t.nbytes / t.type.size(),
-            std::move(strides),
-            array::Flags{true, row_contiguous, col_contiguous});
-        out.set_status(array::Status::available);
-        res.insert({t.key, std::move(out)});
-        continue;
+      }
+      // Keep the mapping only if the allocator can wrap it (Metal, not CPU)
+      if (mapping) {
+        auto probe = allocator::make_buffer(mapping->ptr, page);
+        if (probe.ptr() == nullptr) {
+          mapping = nullptr;
+        } else {
+          allocator::release(probe);
+        }
       }
     }
 #endif
-    res.insert({t.key, lazy_load(t, in_stream, stream)});
   }
-  return {res, std::move(header.metadata)};
+
+  const TensorEntry& entry(const std::string& key) const {
+    auto it = tensors.find(key);
+    if (it == tensors.end()) {
+      std::ostringstream msg;
+      msg << "[SafetensorsFile] No tensor '" << key << "' in " << file;
+      throw std::invalid_argument(msg.str());
+    }
+    return it->second;
+  }
+
+  array get(const std::string& key) const {
+    const auto& t = entry(key);
+    if (auto out = map_array(mapping, t.begin, t.nbytes, t.type, t.shape)) {
+      return *out;
+    }
+    return lazy_load(t, in_stream, stream);
+  }
+};
+
+SafetensorsFile::SafetensorsFile(
+    const std::string& file,
+    bool zero_copy,
+    StreamOrDevice s)
+    : impl_(std::make_shared<Impl>(file, zero_copy, s)) {}
+
+const std::vector<std::string>& SafetensorsFile::keys() const {
+  return impl_->keys;
+}
+
+const std::unordered_map<std::string, std::string>& SafetensorsFile::metadata()
+    const {
+  return impl_->metadata;
+}
+
+bool SafetensorsFile::contains(const std::string& key) const {
+  return impl_->tensors.count(key) > 0;
+}
+
+bool SafetensorsFile::mapped() const {
+  return impl_->mapping != nullptr;
+}
+
+array SafetensorsFile::get(const std::string& key) const {
+  return impl_->get(key);
+}
+
+std::optional<array> SafetensorsFile::get_rows(
+    const std::vector<std::string>& keys) const {
+  // The tensors must lie back to back in this order with the same dtype and
+  // trailing dimensions: then their row-wise concatenation is one mapped range.
+  if (keys.empty() || !impl_->mapping) {
+    return std::nullopt;
+  }
+  const auto& first = impl_->entry(keys[0]);
+  if (first.shape.empty()) {
+    return std::nullopt;
+  }
+  size_t end = first.begin;
+  int64_t rows = 0;
+  for (const auto& key : keys) {
+    const auto& t = impl_->entry(key);
+    if (t.begin != end || t.type != first.type ||
+        t.shape.size() != first.shape.size() ||
+        !std::equal(
+            t.shape.begin() + 1, t.shape.end(), first.shape.begin() + 1)) {
+      return std::nullopt;
+    }
+    end += t.nbytes;
+    rows += t.shape[0];
+  }
+  Shape shape = first.shape;
+  shape[0] = static_cast<ShapeElem>(rows);
+  return map_array(
+      impl_->mapping, first.begin, end - first.begin, first.type, shape);
+}
+
+SafetensorsLoad load_safetensors(
+    const std::string& file,
+    bool zero_copy,
+    const std::optional<std::vector<std::string>>& keys,
+    StreamOrDevice s) {
+  if (!zero_copy && !keys) {
+    return load_safetensors(std::make_shared<io::ParallelFileReader>(file), s);
+  }
+  SafetensorsFile f(file, zero_copy, s);
+  std::unordered_map<std::string, array> res;
+  for (const auto& key : keys ? *keys : f.keys()) {
+    res.insert({key, f.get(key)});
+  }
+  return {res, f.metadata()};
+}
+
+SafetensorsLoad
+load_safetensors(const std::string& file, bool zero_copy, StreamOrDevice s) {
+  return load_safetensors(file, zero_copy, std::nullopt, s);
+}
+
+bool zero_copy_load_default() {
+  return env::zero_copy_load();
 }
 
 SafetensorsLoad load_safetensors(const std::string& file, StreamOrDevice s) {
-  return load_safetensors(file, env::zero_copy_load(), s);
+  return load_safetensors(file, zero_copy_load_default(), s);
 }
 
 void save_safetensors(
