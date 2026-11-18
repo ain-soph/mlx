@@ -11,6 +11,7 @@ on:
         default: '3.12 3.15'
   push:
     branches: [serving]
+    paths-ignore: ['.github/workflows/tensorops-info.yml']
 
 jobs:
   build:

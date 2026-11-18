@@ -4,6 +4,9 @@ name: TensorOps info
 
 on:
   workflow_dispatch:
+  push:
+    branches: [serving]
+    paths: ['.github/workflows/tensorops-info.yml']
 
 jobs:
   info:
@@ -17,7 +20,7 @@ jobs:
           echo "toolchain: $TC"
           H=$(find "$TC" /Applications/Xcode*.app -path "*MetalPerformancePrimitives*" -name "*.h" 2>/dev/null | sort -u)
           echo "$H"
-          for f in $H; do echo "===== $f"; grep -n -i -E "int8|uint8|half|bfloat|float8|e4m3|e5m2|int4|fp4|int32|static_assert|is_same|enable_if|reduced_precision|accum" "$f" | head -200; done
+          mkdir -p /tmp/mpp; for f in $H; do cp "$f" /tmp/mpp/ 2>/dev/null; echo "===== $f"; grep -n -i -E "int8|uint8|half|bfloat|float8|e4m3|e5m2|int4|fp4|int32|static_assert|is_same|enable_if|reduced_precision|accum" "$f" | head -200; done
       - uses: actions/upload-artifact@v4
         with:
           name: mpp-headers
