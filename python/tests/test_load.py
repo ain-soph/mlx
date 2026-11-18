@@ -655,8 +655,9 @@ class TestLoad(mlx_tests.MLXTestCase):
         self.assertEqual(spans[0][0][0], 0)
         for (a, _), (b, _) in zip(spans, spans[1:]):
             self.assertEqual(a[1], b[0])
+        # then the largest other tensor, which also starts on a page
         self.assertEqual([k for _, k in spans], ["q", "k", "v", "small", "odd"])
-        for (begin, end), key in spans[:3]:
+        for (begin, end), key in spans[:4]:
             self.assertEqual((start + begin) % page, 0)
 
         for zero_copy in (False, True):

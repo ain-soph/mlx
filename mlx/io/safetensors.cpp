@@ -12,6 +12,7 @@
 #include <unistd.h>
 #endif
 
+#include "mlx/backend/common/utils.h"
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/io.h"
 #include "mlx/io/load.h"
@@ -295,16 +296,17 @@ load_safetensors(const std::string& file, bool zero_copy, StreamOrDevice s) {
   auto stream = cu::is_available() ? to_stream(s) : to_stream(s, Device::cpu);
   auto header = read_safetensors_header(*in_stream);
 
-  // A tensor is mapped instead of read when it starts on a page boundary
-  // and spans whole pages (what newBufferWithBytesNoCopy accepts); the GPU
-  // then reads it straight from the page cache. Other tensors, and every
-  // tensor when the allocator cannot wrap the memory, load as usual.
+  // A tensor that starts on a page boundary is mapped instead of read; the
+  // GPU then reads it straight from the page cache. Metal wraps only whole
+  // pages, so the mapped range is rounded up to a page (the file must extend
+  // that far; what lies past the tensor is never read). Other tensors, and
+  // every tensor when the allocator cannot wrap the memory, load as usual.
   std::unordered_map<std::string, array> res;
 #ifndef _WIN32
   const size_t page = static_cast<size_t>(getpagesize());
   std::shared_ptr<FileMapping> mapping;
   for (const auto& t : header.tensors) {
-    if (t.nbytes > 0 && t.begin % page == 0 && t.nbytes % page == 0) {
+    if (t.nbytes > 0 && t.begin % page == 0) {
       mapping = map_file(file);
       break;
     }
@@ -312,15 +314,29 @@ load_safetensors(const std::string& file, bool zero_copy, StreamOrDevice s) {
 #endif
   for (const auto& t : header.tensors) {
 #ifndef _WIN32
+    size_t padded = (t.nbytes + page - 1) / page * page;
     if (mapping && t.nbytes > 0 && t.begin % page == 0 &&
-        t.nbytes % page == 0 && t.begin + t.nbytes <= mapping->size) {
+        t.begin + padded <= mapping->size) {
       auto ptr = static_cast<char*>(mapping->ptr) + t.begin;
-      auto probe = allocator::make_buffer(ptr, t.nbytes);
-      if (probe.ptr() != nullptr) {
-        allocator::release(probe);
+      auto buffer = allocator::make_buffer(ptr, padded);
+      if (buffer.ptr() != nullptr) {
+        array out(t.shape, t.type, nullptr, {});
+        Strides strides(t.shape.size(), 1);
+        for (int i = static_cast<int>(t.shape.size()) - 2; i >= 0; --i) {
+          strides[i] = strides[i + 1] * t.shape[i + 1];
+        }
+        auto [no_bsx_size, row_contiguous, col_contiguous] =
+            check_contiguity(t.shape, strides);
         // The deleter holds the mapping until the last mapped array is freed.
-        res.insert(
-            {t.key, array(ptr, t.shape, t.type, [mapping](void*) {})});
+        out.set_data(
+            allocator::Data(
+                buffer,
+                [mapping](allocator::Buffer b) { allocator::release(b); }),
+            t.nbytes / t.type.size(),
+            std::move(strides),
+            array::Flags{true, row_contiguous, col_contiguous});
+        out.set_status(array::Status::available);
+        res.insert({t.key, std::move(out)});
         continue;
       }
     }
@@ -367,9 +383,18 @@ void save_safetensors(
 #ifndef _WIN32
   if (page_align) {
     page = static_cast<size_t>(getpagesize());
-    std::stable_partition(a.begin(), a.end(), [page](const auto& p) {
+    auto rest = std::stable_partition(a.begin(), a.end(), [page](const auto& p) {
       return p.second.nbytes() > 0 && p.second.nbytes() % page == 0;
     });
+    // The first of the other tensors also starts on a page: make it the
+    // largest one (e.g. an embedding table); the small ones after it fill
+    // its last page, so it can be mapped too.
+    auto largest = std::max_element(rest, a.end(), [](const auto& x, const auto& y) {
+      return x.second.nbytes() < y.second.nbytes();
+    });
+    if (largest != a.end()) {
+      std::rotate(rest, largest, largest + 1);
+    }
   }
 #endif
 
