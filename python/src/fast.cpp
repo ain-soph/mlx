@@ -153,7 +153,8 @@ void init_fast(nb::module_& parent_module) {
           "def convrot_quantize_weight(w: array, *, stream: StreamOrDevice = None) -> tuple[array, array]"),
       R"pbdoc(
         Quantize a float weight ``[N, K]`` to ConvRot ``int8`` rows and
-        ``float32`` row scales (rotation in float32, independent of the device).
+        ``float32`` row scales (rotation as a float32 matrix product, which follows
+        ``MLX_ENABLE_TF32`` on GPUs with TensorOps).
       )pbdoc");
   m.def(
       "convrot_matmul",

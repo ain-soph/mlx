@@ -138,8 +138,8 @@ MLX_API std::pair<array, array> convrot_quantize(
 
 /**
  * Quantize a float weight [N, K] to ConvRot int8 rows and float32 row scales.
- * Uses a float32 matrix product for the rotation (the reference math), so the
- * result does not depend on the device.
+ * Uses a float32 matrix product for the rotation (the reference math; on a GPU
+ * with TensorOps that product follows MLX_ENABLE_TF32 like any float32 matmul).
  */
 MLX_API std::pair<array, array> convrot_quantize_weight(
     const array& w,
