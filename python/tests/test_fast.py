@@ -5,6 +5,7 @@ import os
 import unittest
 
 import mlx.core as mx
+import numpy as np
 import mlx_tests
 
 
@@ -1302,6 +1303,75 @@ class TestFast(mlx_tests.MLXTestCase):
         )
         mx.eval(out)
         self.assertEqual(out.tolist(), [-1, -1, -1, -1])
+
+
+class TestConvRot(mlx_tests.MLXTestCase):
+    @staticmethod
+    def hadamard():
+        h4 = np.ones((4, 4), dtype=np.float32)
+        np.fill_diagonal(h4[:, ::-1], -1)
+        return np.kron(np.kron(h4, h4), np.kron(h4, h4)) / 16
+
+    def reference_quantize(self, x):
+        x = np.asarray(x, dtype=np.float32)
+        rot = (x.reshape(-1, 256) @ self.hadamard()).reshape(x.shape)
+        scale = np.maximum(np.abs(rot).max(axis=-1) / 127, 1e-20)
+        return np.clip(np.round(rot / scale[:, None]), -127, 127).astype(np.int8), scale
+
+    def test_quantize_weight(self):
+        w = mx.random.normal((96, 512), key=mx.random.key(0))
+        q, s = mx.fast.convrot_quantize_weight(w)
+        self.assertEqual(q.dtype, mx.int8)
+        self.assertEqual(s.dtype, mx.float32)
+        self.assertEqual(q.shape, (96, 512))
+        rq, rs = self.reference_quantize(w)
+        self.assertTrue(np.allclose(np.array(s), rs, rtol=1e-6))
+        self.assertLessEqual(np.abs(np.array(q).astype(int) - rq.astype(int)).max(), 1)
+        # dequantized and rotated back: close to w
+        back = (np.array(q).astype(np.float32) * np.array(s)[:, None]).reshape(-1, 256) @ self.hadamard()
+        self.assertLess(np.abs(back.reshape(w.shape) - np.array(w)).max(), 0.05)
+
+    def test_quantize_activations(self):
+        x = mx.random.normal((37, 768), key=mx.random.key(1)).astype(mx.bfloat16)
+        q, s = mx.fast.convrot_quantize(x)
+        self.assertEqual(q.shape, (128, 768))  # rows padded to a multiple of 128
+        self.assertEqual(s.shape, (37,))
+        rq, rs = self.reference_quantize(np.array(x.astype(mx.float32)))
+        self.assertTrue(np.allclose(np.array(s), rs, rtol=1e-5))
+        self.assertLessEqual(np.abs(np.array(q[:37]).astype(int) - rq.astype(int)).max(), 1)
+
+    def test_matmul(self):
+        for m, n, k, dtype in [
+            (1, 64, 256, mx.float32),     # narrower than one column tile: float product
+            (5, 200, 512, mx.bfloat16),
+            (130, 300, 768, mx.float16),  # partial row and column tiles
+            (257, 1024, 512, mx.bfloat16),
+        ]:
+            with self.subTest(m=m, n=n, k=k, dtype=dtype):
+                x = mx.random.normal((m, k), key=mx.random.key(m)).astype(dtype)
+                w = mx.random.normal((n, k), key=mx.random.key(n)) / 16
+                q, s = mx.fast.convrot_quantize_weight(w)
+                y = mx.fast.convrot_matmul(x, q, s)
+                self.assertEqual(y.shape, (m, n))
+                self.assertEqual(y.dtype, dtype)
+                ref = x.astype(mx.float32) @ w.T
+                err = mx.abs(y.astype(mx.float32) - ref).max() / mx.abs(ref).max()
+                self.assertLess(err.item(), 0.05)
+                # leading dimensions and a shared quantization
+                y3 = mx.fast.convrot_matmul(x.reshape(1, m, k), q, s)
+                self.assertTrue(mx.array_equal(y3.reshape(m, n), y))
+                xq, xs = mx.fast.convrot_quantize(x)
+                y2 = mx.fast.convrot_matmul_quantized(xq, xs, q, s, dtype)
+                self.assertTrue(mx.array_equal(y2, y))
+                for tiles in ((64, 128, 64), (64, 128, 32), (32, 64, 256)):
+                    yt = mx.fast.convrot_matmul_quantized(xq, xs, q, s, dtype, tiles=tiles)
+                    self.assertTrue(mx.array_equal(yt, y), tiles)
+
+    def test_errors(self):
+        with self.assertRaises(ValueError):
+            mx.fast.convrot_quantize(mx.zeros((4, 100)))
+        with self.assertRaises(ValueError):
+            mx.fast.convrot_matmul(mx.zeros((4, 256)), mx.zeros((8, 256)), mx.ones((8,)))
 
 
 if __name__ == "__main__":

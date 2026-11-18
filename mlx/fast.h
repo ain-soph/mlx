@@ -117,4 +117,59 @@ MLX_API std::vector<array> precompiled_cuda_kernel(
     bool ensure_row_contiguous = false,
     StreamOrDevice s = {});
 
+/**
+ * ConvRot W8A8 (the ComfyUI "int8_convrot" format): a weight W [N, K] is stored
+ * as int8 rows of W H with one float32 scale per row, where H is block-diagonal
+ * with 256x256 Hadamard blocks along K (K a multiple of 256). At run time the
+ * activations get the same rotation and a per-row int8 quantization, so the
+ * rotations cancel: y = q(x H) q(W H)^T * x_scale * w_scale ~ x W^T.
+ */
+
+/**
+ * Rotate the rows of x [M, K] by H and quantize each row to int8. Returns
+ * (int8 [M', K], float32 [M]) where M' is M rounded up to a multiple of 128:
+ * the extra rows are unspecified and let the TensorOps GEMM read whole tiles.
+ * Pass the pair to convrot_matmul_quantized to reuse one quantization for
+ * several weights that read the same input (e.g. Q, K and V).
+ */
+MLX_API std::pair<array, array> convrot_quantize(
+    const array& x,
+    StreamOrDevice s = {});
+
+/**
+ * Quantize a float weight [N, K] to ConvRot int8 rows and float32 row scales.
+ * Uses a float32 matrix product for the rotation (the reference math), so the
+ * result does not depend on the device.
+ */
+MLX_API std::pair<array, array> convrot_quantize_weight(
+    const array& w,
+    StreamOrDevice s = {});
+
+/**
+ * y = x W^T for a ConvRot int8 weight w [N, K] with float32 scales [N];
+ * x [..., K] in any float type, y [..., N] in x's type. On a GPU with TensorOps
+ * (M5) the activations are rotated and quantized in one kernel and the product
+ * runs on the INT8 TensorOps path; elsewhere it is computed in float.
+ */
+MLX_API array convrot_matmul(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s = {});
+
+/**
+ * As convrot_matmul, from a convrot_quantize result; y [M, N] in `dtype`.
+ * tiles = (BM, BN, BK) overrides the GEMM tile shape (every tiling gives the
+ * same bytes: the int32 sums are exact). BM must not exceed 128, the row
+ * padding of convrot_quantize, and xq must have a multiple of BM rows.
+ */
+MLX_API array convrot_matmul_quantized(
+    const array& xq,
+    const array& xs,
+    const array& w,
+    const array& scales,
+    Dtype dtype,
+    std::optional<std::tuple<int, int, int>> tiles = std::nullopt,
+    StreamOrDevice s = {});
+
 } // namespace mlx::core::fast

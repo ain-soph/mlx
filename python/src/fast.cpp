@@ -119,6 +119,88 @@ void init_fast(nb::module_& parent_module) {
       parent_module.def_submodule("fast", "mlx.core.fast: fast operations");
 
   m.def(
+      "convrot_quantize",
+      &mx::fast::convrot_quantize,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def convrot_quantize(x: array, *, stream: StreamOrDevice = None) -> tuple[array, array]"),
+      R"pbdoc(
+        Rotate and quantize activations for :func:`convrot_matmul_quantized`.
+
+        ConvRot W8A8 (the ComfyUI ``int8_convrot`` format) stores a weight
+        ``W`` as int8 rows of ``W H`` with one float32 scale per row, where
+        ``H`` is block diagonal with 256x256 Hadamard blocks along the input
+        dimension. The activations get the same rotation and a per-row int8
+        quantization, so the rotations cancel in the product.
+
+        Args:
+            x (array): Activations of shape ``[M, K]``, ``K`` a multiple of 256.
+
+        Returns:
+            tuple(array, array): ``int8`` rows of shape ``[M', K]``, where
+            ``M'`` is ``M`` rounded up to a multiple of 128 (the extra rows are
+            unspecified), and ``float32`` row scales of shape ``[M]``.
+      )pbdoc");
+  m.def(
+      "convrot_quantize_weight",
+      &mx::fast::convrot_quantize_weight,
+      "w"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def convrot_quantize_weight(w: array, *, stream: StreamOrDevice = None) -> tuple[array, array]"),
+      R"pbdoc(
+        Quantize a float weight ``[N, K]`` to ConvRot ``int8`` rows and
+        ``float32`` row scales (rotation in float32, independent of the device).
+      )pbdoc");
+  m.def(
+      "convrot_matmul",
+      &mx::fast::convrot_matmul,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def convrot_matmul(x: array, w: array, scales: array, *, stream: StreamOrDevice = None) -> array"),
+      R"pbdoc(
+        ``x @ W.T`` for a ConvRot ``int8`` weight with ``float32`` row scales.
+
+        On a GPU with TensorOps (Apple M5 and later, macOS 26.2+) the
+        activations are rotated and quantized in one kernel and the product
+        runs on the INT8 TensorOps path; elsewhere it is computed in float.
+
+        Args:
+            x (array): Activations ``[..., K]`` (any float type).
+            w (array): ``int8`` weight ``[N, K]`` (rotated rows).
+            scales (array): ``float32`` row scales ``[N]``.
+
+        Returns:
+            array: ``[..., N]`` in the type of ``x``.
+      )pbdoc");
+  m.def(
+      "convrot_matmul_quantized",
+      &mx::fast::convrot_matmul_quantized,
+      "xq"_a,
+      "xs"_a,
+      "w"_a,
+      "scales"_a,
+      "dtype"_a,
+      nb::kw_only(),
+      "tiles"_a = nb::none(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def convrot_matmul_quantized(xq: array, xs: array, w: array, scales: array, dtype: Dtype, *, tiles: tuple[int, int, int] | None = None, stream: StreamOrDevice = None) -> array"),
+      R"pbdoc(
+        As :func:`convrot_matmul` from a :func:`convrot_quantize` result, so
+        several weights that read the same input (e.g. Q, K and V) share one
+        activation quantization. Returns ``[M, N]`` in ``dtype``.
+        ``tiles=(BM, BN, BK)`` overrides the GEMM tile shape (same bytes for
+        every tiling; BM at most 128 and dividing the rows of ``xq``).
+      )pbdoc");
+  m.def(
       "rms_norm",
       &mx::fast::rms_norm,
       "x"_a,

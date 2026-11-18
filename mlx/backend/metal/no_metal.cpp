@@ -12,6 +12,10 @@ bool is_available() {
   return false;
 }
 
+bool is_tensor_ops_available() {
+  return false;
+}
+
 void start_capture(std::string) {}
 void stop_capture() {}
 

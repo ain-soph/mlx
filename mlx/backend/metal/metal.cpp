@@ -17,6 +17,10 @@ bool is_available() {
   return true;
 }
 
+bool is_tensor_ops_available() {
+  return is_nax_available();
+}
+
 void start_capture(std::string path, NS::Object* object) {
   auto pool = new_scoped_memory_pool();
 
