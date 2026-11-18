@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <exception>
 #include <limits>
 #include <sstream>
@@ -223,6 +224,15 @@ inline bool residency_debug() {
 inline bool zero_copy_load() {
   static bool zero_copy_load_ = get_var("MLX_ZERO_COPY_LOAD", 0);
   return zero_copy_load_;
+}
+
+// Optional cache limit in MiB for the GPU allocator (0 = the default, which
+// lets the buffer cache grow to the memory limit). Same as calling
+// set_cache_limit at start-up, without code changes.
+inline size_t cache_limit_mb() {
+  static size_t cache_limit_mb_ =
+      static_cast<size_t>(std::max(get_var("MLX_CACHE_LIMIT_MB", 0), 0));
+  return cache_limit_mb_;
 }
 
 inline bool metal_fast_synch() {

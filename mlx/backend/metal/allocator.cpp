@@ -4,6 +4,7 @@
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/resident.h"
 #include "mlx/memory.h"
+#include "mlx/utils.h"
 
 #include <mach/vm_page_size.h>
 #include <unistd.h>
@@ -63,6 +64,9 @@ MetalAllocator::MetalAllocator(Device& d)
   block_limit_ = std::min(1.5 * max_rec_size, 0.95 * memsize);
   gc_limit_ = std::min(static_cast<size_t>(0.95 * max_rec_size), block_limit_);
   max_pool_size_ = block_limit_;
+  if (auto mb = env::cache_limit_mb(); mb > 0) {
+    max_pool_size_ = mb << 20;
+  }
   bool is_vm = std::get<std::string>(info.at("device_name")) ==
       "Apple Paravirtual device";
   if (is_vm) {
