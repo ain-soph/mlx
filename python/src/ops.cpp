@@ -4608,9 +4608,10 @@ void init_ops(nb::module_& m) {
       "format"_a = nb::none(),
       "return_metadata"_a = false,
       nb::kw_only(),
+      "zero_copy"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def load(file: file | str | pathlib.Path, /, format: str | None = None, return_metadata: bool = False, *, stream: StreamOrDevice = None) -> array | dict[str, array] | tuple[dict[str, array], dict[str, Any]]"),
+          "def load(file: file | str | pathlib.Path, /, format: str | None = None, return_metadata: bool = False, *, zero_copy: bool | None = None, stream: StreamOrDevice = None) -> array | dict[str, array] | tuple[dict[str, array], dict[str, Any]]"),
       R"pbdoc(
         Load array(s) from a binary file.
 
@@ -4625,6 +4626,14 @@ void init_ops(nb::module_& m) {
             return_metadata (bool, optional): Load the metadata for formats
               which support matadata. The metadata will be returned as an
               additional dictionary. Default: ``False``.
+            zero_copy (bool, optional): For a ``.safetensors`` file given by
+              path: map each tensor that starts on a page boundary and spans
+              whole pages read-only from the file instead of reading it into
+              a new buffer (see ``page_align`` in :func:`save_safetensors`).
+              The GPU then reads those weights straight from the page cache,
+              and an idle process holds no copy of them. Other tensors load
+              as usual. If ``None``, the ``MLX_ZERO_COPY_LOAD`` environment
+              variable decides. Default: ``None``.
         Returns:
             array, dict, or tuple:
                 A single array if loading from a ``.npy`` file or a dict
@@ -4644,8 +4653,10 @@ void init_ops(nb::module_& m) {
       "file"_a,
       "arrays"_a,
       "metadata"_a = nb::none(),
+      nb::kw_only(),
+      "page_align"_a = false,
       nb::sig(
-          "def save_safetensors(file: file | str | pathlib.Path, arrays: dict[str, array], metadata: dict[str, str] | None = None)"),
+          "def save_safetensors(file: file | str | pathlib.Path, arrays: dict[str, array], metadata: dict[str, str] | None = None, *, page_align: bool = False)"),
       R"pbdoc(
         Save array(s) to a binary file in ``.safetensors`` format.
 
@@ -4659,6 +4670,12 @@ void init_ops(nb::module_& m) {
               be saved.
             metadata (dict(str, str), optional): The dictionary of
               metadata to be saved.
+            page_align (bool, optional): Pad the header to a page and write
+              the tensors whose size is a whole number of pages first, so
+              each of them starts on a page boundary and can be loaded with
+              ``mx.load(..., zero_copy=True)``. The file stays an ordinary
+              safetensors file without gaps. Tensors are written in the
+              dictionary's order within each group. Default: ``False``.
       )pbdoc");
   m.def(
       "save_gguf",

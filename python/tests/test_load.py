@@ -1,5 +1,6 @@
 # Copyright © 2023 Apple Inc.
 
+import json
 import os
 import platform
 import struct
@@ -627,6 +628,61 @@ class TestLoad(mlx_tests.MLXTestCase):
         loaded = mx.load(st_file)
         self.assertEqual(loaded["x"].shape, (0, 3))
         self.assertTrue(mx.array_equal(loaded["y"], mx.ones((2, 2))))
+
+    def test_save_safetensors_page_align(self):
+        page = os.sysconf("SC_PAGE_SIZE")
+        arrays = {
+            "small": mx.arange(10, dtype=mx.float32),
+            "q": mx.random.normal((page // 2, 4)).astype(mx.float16),
+            "k": mx.random.normal((page // 2, 4)).astype(mx.float16),
+            "odd": mx.arange(7, dtype=mx.int8),
+            "v": mx.random.normal((page // 2, 4)).astype(mx.float16),
+        }
+        path = os.path.join(self.test_dir, "aligned.safetensors")
+        mx.save_safetensors(path, arrays, {"m": "x"}, page_align=True)
+
+        with open(path, "rb") as f:
+            (header_len,) = struct.unpack("<Q", f.read(8))
+            header = json.loads(f.read(header_len))
+        start = 8 + header_len
+        self.assertEqual(start % page, 0)
+        spans = sorted(
+            (spec["data_offsets"], key)
+            for key, spec in header.items()
+            if key != "__metadata__"
+        )
+        # Gap-free, whole-page tensors first in dictionary order, then the rest
+        self.assertEqual(spans[0][0][0], 0)
+        for (a, _), (b, _) in zip(spans, spans[1:]):
+            self.assertEqual(a[1], b[0])
+        self.assertEqual([k for _, k in spans], ["q", "k", "v", "small", "odd"])
+        for (begin, end), key in spans[:3]:
+            self.assertEqual((start + begin) % page, 0)
+
+        for zero_copy in (False, True):
+            loaded, metadata = mx.load(path, return_metadata=True, zero_copy=zero_copy)
+            self.assertEqual(metadata, {"m": "x"})
+            for key, value in arrays.items():
+                self.assertTrue(mx.array_equal(loaded[key], value))
+
+    def test_load_zero_copy_unaligned(self):
+        # An ordinary file loads the same with zero_copy (nothing is mapped)
+        arrays = {"a": mx.arange(1000, dtype=mx.float32), "b": mx.ones((3, 5))}
+        path = os.path.join(self.test_dir, "plain.safetensors")
+        mx.save_safetensors(path, arrays)
+        loaded = mx.load(path, zero_copy=True)
+        for key, value in arrays.items():
+            self.assertTrue(mx.array_equal(loaded[key], value))
+
+    def test_load_zero_copy_outlives_file_handle(self):
+        page = os.sysconf("SC_PAGE_SIZE")
+        x = mx.random.normal((page, 2)).astype(mx.float16)
+        path = os.path.join(self.test_dir, "mapped.safetensors")
+        mx.save_safetensors(path, {"x": x}, page_align=True)
+        y = mx.load(path, zero_copy=True)["x"]
+        # The mapped array stays valid and usable in computation
+        self.assertTrue(mx.array_equal(y * 2, x * 2))
+        del y
 
 
 if __name__ == "__main__":

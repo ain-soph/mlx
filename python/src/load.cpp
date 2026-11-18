@@ -183,9 +183,15 @@ class PyFileReader : public mx::io::Reader {
 std::pair<
     std::unordered_map<std::string, mx::array>,
     std::unordered_map<std::string, std::string>>
-mlx_load_safetensor_helper(nb::object file, mx::StreamOrDevice s) {
+mlx_load_safetensor_helper(
+    nb::object file,
+    mx::StreamOrDevice s,
+    std::optional<bool> zero_copy) {
   if (is_str_or_path(file)) { // Assume .safetensors file path string
     auto file_str = nb::cast<std::string>(nb::str(file));
+    if (zero_copy.has_value()) {
+      return mx::load_safetensors(file_str, zero_copy.value(), s);
+    }
     return mx::load_safetensors(file_str, s);
   } else if (is_istream_object(file)) {
     // If we don't own the stream and it was passed to us, eval immediately
@@ -276,6 +282,7 @@ LoadOutputTypes mlx_load_helper(
     nb::object file,
     std::optional<std::string> format,
     bool return_metadata,
+    std::optional<bool> zero_copy,
     mx::StreamOrDevice s) {
   if (!format.has_value()) {
     std::string fname;
@@ -300,7 +307,7 @@ LoadOutputTypes mlx_load_helper(
         "[load] metadata not supported for format " + format.value());
   }
   if (format.value() == "safetensors") {
-    auto [dict, metadata] = mlx_load_safetensor_helper(file, s);
+    auto [dict, metadata] = mlx_load_safetensor_helper(file, s, zero_copy);
     if (return_metadata) {
       return std::make_pair(dict, metadata);
     }
@@ -478,7 +485,8 @@ void mlx_savez_helper(
 void mlx_save_safetensor_helper(
     nb::object file,
     nb::dict d,
-    std::optional<nb::dict> m) {
+    std::optional<nb::dict> m,
+    bool page_align) {
   std::unordered_map<std::string, std::string> metadata_map;
   if (m) {
     try {
@@ -491,18 +499,25 @@ void mlx_save_safetensor_helper(
   } else {
     metadata_map = std::unordered_map<std::string, std::string>();
   }
-  auto arrays_map = nb::cast<std::unordered_map<std::string, mx::array>>(d);
+  // Keep the dictionary's order: it is the order of the tensors in the file.
+  std::vector<std::pair<std::string, mx::array>> arrays;
+  arrays.reserve(d.size());
+  for (auto [k, v] : d) {
+    arrays.emplace_back(nb::cast<std::string>(k), nb::cast<mx::array>(v));
+  }
   if (is_str_or_path(file)) {
     {
       auto file_str = nb::cast<std::string>(nb::str(file));
       nb::gil_scoped_release nogil;
-      mx::save_safetensors(file_str, arrays_map, metadata_map);
+      mx::save_safetensors(
+          file_str, std::move(arrays), std::move(metadata_map), page_align);
     }
   } else if (is_ostream_object(file)) {
     auto writer = std::make_shared<PyFileWriter>(file);
     {
       nb::gil_scoped_release nogil;
-      mx::save_safetensors(writer, arrays_map, metadata_map);
+      mx::save_safetensors(
+          writer, std::move(arrays), std::move(metadata_map), page_align);
     }
   } else {
     throw std::invalid_argument(

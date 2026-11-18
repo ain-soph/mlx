@@ -34,4 +34,30 @@ void save_safetensors(
       "to enable safetensors support.");
 }
 
+SafetensorsLoad load_safetensors(const std::string&, bool, StreamOrDevice) {
+  throw std::runtime_error(
+      "[load_safetensors] Compile with MLX_BUILD_SAFETENSORS=ON "
+      "to enable safetensors support.");
+}
+
+void save_safetensors(
+    std::shared_ptr<io::Writer>,
+    std::vector<std::pair<std::string, array>>,
+    std::unordered_map<std::string, std::string>,
+    bool) {
+  throw std::runtime_error(
+      "[save_safetensors] Compile with MLX_BUILD_SAFETENSORS=ON "
+      "to enable safetensors support.");
+}
+
+void save_safetensors(
+    std::string,
+    std::vector<std::pair<std::string, array>>,
+    std::unordered_map<std::string, std::string>,
+    bool) {
+  throw std::runtime_error(
+      "[save_safetensors] Compile with MLX_BUILD_SAFETENSORS=ON "
+      "to enable safetensors support.");
+}
+
 } // namespace mlx::core

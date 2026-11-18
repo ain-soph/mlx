@@ -1,9 +1,16 @@
 // Copyright © 2023 Apple Inc.
 
+#include <algorithm>
 #include <json.hpp>
 #include <memory>
 #include <sstream>
 #include <stack>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/io.h"
@@ -11,6 +18,7 @@
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
 #include "mlx/transforms.h"
+#include "mlx/utils.h"
 
 using json = nlohmann::json;
 
@@ -107,36 +115,47 @@ Dtype dtype_from_safetensor_str(std::string_view str) {
   }
 }
 
-/** Load array from reader in safetensor format */
-SafetensorsLoad load_safetensors(
-    std::shared_ptr<io::Reader> in_stream,
-    StreamOrDevice s) {
+namespace {
+
+struct TensorEntry {
+  std::string key;
+  Dtype type;
+  Shape shape;
+  size_t begin; // absolute file offset of the first byte
+  size_t nbytes;
+};
+
+struct SafetensorsHeader {
+  std::vector<TensorEntry> tensors;
+  std::unordered_map<std::string, std::string> metadata;
+};
+
+/** Read and validate the header; leaves the stream position unspecified */
+SafetensorsHeader read_safetensors_header(io::Reader& in_stream) {
   ////////////////////////////////////////////////////////
   // Open and check file
-  if (!in_stream->good() || !in_stream->is_open()) {
+  if (!in_stream.good() || !in_stream.is_open()) {
     std::ostringstream msg;
-    msg << "[load_safetensors] Failed to open " << in_stream->label();
+    msg << "[load_safetensors] Failed to open " << in_stream.label();
     throw std::runtime_error(msg.str());
   }
-
-  auto stream = cu::is_available() ? to_stream(s) : to_stream(s, Device::cpu);
 
   uint64_t jsonHeaderLength = 0;
   // This is the same limit as in the original Rust Safetensors code.
   constexpr uint64_t kMaxJsonHeaderLength = 100000000;
-  in_stream->read(reinterpret_cast<char*>(&jsonHeaderLength), 8);
+  in_stream.read(reinterpret_cast<char*>(&jsonHeaderLength), 8);
   if (jsonHeaderLength <= 0 || jsonHeaderLength >= kMaxJsonHeaderLength) {
     std::ostringstream msg;
     msg << "[load_safetensors] Invalid json header length "
-        << in_stream->label();
+        << in_stream.label();
     throw std::runtime_error(msg.str());
   }
 
   // Determine file size to be able to validate that reads are within the
   // bounds of the file (at least at creation time)
-  in_stream->seek(0, std::ios_base::end);
-  size_t file_size = in_stream->tell();
-  in_stream->seek(8, std::ios_base::beg);
+  in_stream.seek(0, std::ios_base::end);
+  size_t file_size = in_stream.tell();
+  in_stream.seek(8, std::ios_base::beg);
 
   // Load the json metadata
   if (file_size < jsonHeaderLength + 8) {
@@ -147,23 +166,21 @@ SafetensorsLoad load_safetensors(
     throw std::runtime_error(msg.str());
   }
   auto rawJson = std::make_unique<char[]>(jsonHeaderLength);
-  in_stream->read(rawJson.get(), jsonHeaderLength);
+  in_stream.read(rawJson.get(), jsonHeaderLength);
   auto metadata = json::parse(rawJson.get(), rawJson.get() + jsonHeaderLength);
   // Should always be an object on the top-level
   if (!metadata.is_object()) {
     std::ostringstream msg;
-    msg << "[load_safetensors] Invalid json metadata " << in_stream->label();
+    msg << "[load_safetensors] Invalid json metadata " << in_stream.label();
     throw std::runtime_error(msg.str());
   }
   size_t offset = jsonHeaderLength + 8;
 
-  // Load the arrays using metadata
-  std::unordered_map<std::string, array> res;
-  std::unordered_map<std::string, std::string> metadata_map;
+  SafetensorsHeader header;
   for (const auto& item : metadata.items()) {
     if (item.key() == "__metadata__") {
       for (const auto& meta_item : item.value().items()) {
-        metadata_map.insert({meta_item.key(), meta_item.value()});
+        header.metadata.insert({meta_item.key(), meta_item.value()});
       }
       continue;
     }
@@ -201,26 +218,127 @@ SafetensorsLoad load_safetensors(
           << "Perhaps an incomplete download or corrupt file?";
       throw std::runtime_error(msg.str());
     }
-    res.insert(
+    header.tensors.push_back(
         {item.key(),
-         array(
-             shape,
-             type,
-             std::make_shared<Load>(
-                 stream, in_stream, offset + data_offsets.at(0), false),
-             std::vector<array>{})});
+         type,
+         shape,
+         offset + data_offsets[0],
+         data_offsets[1] - data_offsets[0]});
   }
-  return {res, metadata_map};
+  return header;
+}
+
+array lazy_load(
+    const TensorEntry& t,
+    std::shared_ptr<io::Reader> in_stream,
+    Stream stream) {
+  return array(
+      t.shape,
+      t.type,
+      std::make_shared<Load>(stream, in_stream, t.begin, false),
+      std::vector<array>{});
+}
+
+#ifndef _WIN32
+/** A read-only mapping of a whole file, unmapped with its last array */
+struct FileMapping {
+  void* ptr{MAP_FAILED};
+  size_t size{0};
+  ~FileMapping() {
+    if (ptr != MAP_FAILED) {
+      munmap(ptr, size);
+    }
+  }
+};
+
+std::shared_ptr<FileMapping> map_file(const std::string& file) {
+  int fd = open(file.c_str(), O_RDONLY);
+  if (fd < 0) {
+    return nullptr;
+  }
+  auto mapping = std::make_shared<FileMapping>();
+  off_t size = lseek(fd, 0, SEEK_END);
+  if (size > 0) {
+    mapping->size = static_cast<size_t>(size);
+    mapping->ptr = mmap(nullptr, mapping->size, PROT_READ, MAP_SHARED, fd, 0);
+  }
+  close(fd);
+  if (mapping->ptr == MAP_FAILED) {
+    return nullptr;
+  }
+  return mapping;
+}
+#endif
+
+} // namespace
+
+/** Load array from reader in safetensor format */
+SafetensorsLoad load_safetensors(
+    std::shared_ptr<io::Reader> in_stream,
+    StreamOrDevice s) {
+  auto stream = cu::is_available() ? to_stream(s) : to_stream(s, Device::cpu);
+  auto header = read_safetensors_header(*in_stream);
+
+  std::unordered_map<std::string, array> res;
+  for (const auto& t : header.tensors) {
+    res.insert({t.key, lazy_load(t, in_stream, stream)});
+  }
+  return {res, std::move(header.metadata)};
+}
+
+SafetensorsLoad
+load_safetensors(const std::string& file, bool zero_copy, StreamOrDevice s) {
+  auto in_stream = std::make_shared<io::ParallelFileReader>(file);
+  if (!zero_copy) {
+    return load_safetensors(in_stream, s);
+  }
+  auto stream = cu::is_available() ? to_stream(s) : to_stream(s, Device::cpu);
+  auto header = read_safetensors_header(*in_stream);
+
+  // A tensor is mapped instead of read when it starts on a page boundary
+  // and spans whole pages (what newBufferWithBytesNoCopy accepts); the GPU
+  // then reads it straight from the page cache. Other tensors, and every
+  // tensor when the allocator cannot wrap the memory, load as usual.
+  std::unordered_map<std::string, array> res;
+#ifndef _WIN32
+  const size_t page = static_cast<size_t>(getpagesize());
+  std::shared_ptr<FileMapping> mapping;
+  for (const auto& t : header.tensors) {
+    if (t.nbytes > 0 && t.begin % page == 0 && t.nbytes % page == 0) {
+      mapping = map_file(file);
+      break;
+    }
+  }
+#endif
+  for (const auto& t : header.tensors) {
+#ifndef _WIN32
+    if (mapping && t.nbytes > 0 && t.begin % page == 0 &&
+        t.nbytes % page == 0 && t.begin + t.nbytes <= mapping->size) {
+      auto ptr = static_cast<char*>(mapping->ptr) + t.begin;
+      auto probe = allocator::make_buffer(ptr, t.nbytes);
+      if (probe.ptr() != nullptr) {
+        allocator::release(probe);
+        // The deleter holds the mapping until the last mapped array is freed.
+        res.insert(
+            {t.key, array(ptr, t.shape, t.type, [mapping](void*) {})});
+        continue;
+      }
+    }
+#endif
+    res.insert({t.key, lazy_load(t, in_stream, stream)});
+  }
+  return {res, std::move(header.metadata)};
 }
 
 SafetensorsLoad load_safetensors(const std::string& file, StreamOrDevice s) {
-  return load_safetensors(std::make_shared<io::ParallelFileReader>(file), s);
+  return load_safetensors(file, env::zero_copy_load(), s);
 }
 
 void save_safetensors(
     std::shared_ptr<io::Writer> out_stream,
-    std::unordered_map<std::string, array> a,
-    std::unordered_map<std::string, std::string> metadata /* = {} */) {
+    std::vector<std::pair<std::string, array>> a,
+    std::unordered_map<std::string, std::string> metadata,
+    bool page_align) {
   {
     std::vector<array> to_eval;
     to_eval.reserve(a.size());
@@ -243,6 +361,18 @@ void save_safetensors(
     throw std::runtime_error(msg.str());
   }
 
+  // Whole-page tensors first: after a page-padded header each of them then
+  // starts on a page boundary, and the rest follows with no gaps.
+  size_t page = 1;
+#ifndef _WIN32
+  if (page_align) {
+    page = static_cast<size_t>(getpagesize());
+    std::stable_partition(a.begin(), a.end(), [page](const auto& p) {
+      return p.second.nbytes() > 0 && p.second.nbytes() % page == 0;
+    });
+  }
+#endif
+
   ////////////////////////////////////////////////////////
   // Check array map
   json parent;
@@ -263,6 +393,10 @@ void save_safetensors(
   }
 
   auto header = parent.dump();
+  if (page > 1) {
+    // The format allows trailing spaces in the header.
+    header.append((page - (8 + header.length()) % page) % page, ' ');
+  }
   uint64_t header_len = header.length();
   out_stream->write(reinterpret_cast<char*>(&header_len), 8);
   out_stream->write(header.c_str(), header_len);
@@ -276,9 +410,21 @@ void save_safetensors(
 }
 
 void save_safetensors(
-    std::string file,
+    std::shared_ptr<io::Writer> out_stream,
     std::unordered_map<std::string, array> a,
     std::unordered_map<std::string, std::string> metadata /* = {} */) {
+  save_safetensors(
+      std::move(out_stream),
+      std::vector<std::pair<std::string, array>>(a.begin(), a.end()),
+      std::move(metadata),
+      false);
+}
+
+void save_safetensors(
+    std::string file,
+    std::vector<std::pair<std::string, array>> a,
+    std::unordered_map<std::string, std::string> metadata,
+    bool page_align) {
   // Add .safetensors to file name if it is not there
   if (file.length() < 12 ||
       file.substr(file.length() - 12, 12) != ".safetensors")
@@ -286,7 +432,21 @@ void save_safetensors(
 
   // Serialize array
   save_safetensors(
-      std::make_shared<io::FileWriter>(std::move(file)), a, metadata);
+      std::make_shared<io::FileWriter>(std::move(file)),
+      std::move(a),
+      std::move(metadata),
+      page_align);
+}
+
+void save_safetensors(
+    std::string file,
+    std::unordered_map<std::string, array> a,
+    std::unordered_map<std::string, std::string> metadata /* = {} */) {
+  save_safetensors(
+      std::move(file),
+      std::vector<std::pair<std::string, array>>(a.begin(), a.end()),
+      std::move(metadata),
+      false);
 }
 
 } // namespace mlx::core

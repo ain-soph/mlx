@@ -1,0 +1,63 @@
+# Wheels for the ain-soph `serving` branch (fork-only; no Metal compiler on the
+# machine that serves the models, so the Metal build runs here).
+name: Serving wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      python-versions:
+        description: 'Space-separated Python versions for the frontend wheel'
+        required: false
+        default: '3.12 3.15'
+  push:
+    branches: [serving]
+
+jobs:
+  build:
+    if: github.repository == 'ain-soph/mlx'
+    runs-on: macos-26
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '26.2'
+      PYPI_RELEASE: 1
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          xcodebuild -showComponent MetalToolchain || xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx metal --version
+          xcrun -sdk macosx --show-sdk-version
+      - name: Build wheels
+        run: |
+          export MLX_LOCAL_VERSION="serving.$(git rev-parse --short HEAD)"
+          mkdir -p wheelhouse
+          for PY in ${{ inputs.python-versions || '3.12 3.15' }}; do
+            uv venv --clear --python "$PY" --managed-python ".venv-$PY"
+            source ".venv-$PY/bin/activate"
+            uv pip install build setuptools typing_extensions cmake
+            python setup.py clean --all
+            MLX_BUILD_FRONTEND_PACKAGE=1 python -m build -w -n
+            if [ ! -f wheelhouse/.backend ]; then
+              python setup.py clean --all
+              MLX_BUILD_BACKEND_PACKAGE=1 python -m build -w -n
+              touch wheelhouse/.backend
+            fi
+            mv dist/*.whl wheelhouse/
+            deactivate
+          done
+          ls -la wheelhouse
+      - name: Test load and quantization on the runner
+        run: |
+          PY=$(echo "${{ inputs.python-versions || '3.12 3.15' }}" | awk '{print $1}')
+          source ".venv-$PY/bin/activate"
+          uv pip install wheelhouse/mlx_metal-*.whl wheelhouse/mlx-*cp$(echo $PY | tr -d .)*.whl numpy pytest
+          cd python/tests
+          python -c "import mlx.core as mx; print(mx.__version__, mx.metal.is_available())"
+          python -m pytest -q test_load.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mlx-serving-wheels
+          path: wheelhouse/*.whl
+          if-no-files-found: error

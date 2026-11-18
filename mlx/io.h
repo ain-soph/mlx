@@ -39,6 +39,16 @@ MLX_API SafetensorsLoad
 load_safetensors(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s = {});
 MLX_API SafetensorsLoad
 load_safetensors(const std::string& file, StreamOrDevice s = {});
+/**
+ * Load from a .safetensors file. With zero_copy, tensors that start on a page
+ * boundary and span whole pages are mapped read-only from the file instead of
+ * read into new buffers (see save_safetensors with page_align). The overload
+ * without the flag uses the MLX_ZERO_COPY_LOAD environment variable.
+ */
+MLX_API SafetensorsLoad load_safetensors(
+    const std::string& file,
+    bool zero_copy,
+    StreamOrDevice s = {});
 
 MLX_API void save_safetensors(
     std::shared_ptr<io::Writer> in_stream,
@@ -48,6 +58,22 @@ MLX_API void save_safetensors(
     std::string file,
     std::unordered_map<std::string, array>,
     std::unordered_map<std::string, std::string> metadata = {});
+/**
+ * Save arrays in the given order. With page_align, the header is padded to a
+ * page and the tensors whose size is a whole number of pages come first, so
+ * each of them starts on a page boundary and can be loaded zero-copy. The
+ * file stays an ordinary, gap-free safetensors file.
+ */
+MLX_API void save_safetensors(
+    std::shared_ptr<io::Writer> out_stream,
+    std::vector<std::pair<std::string, array>> arrays,
+    std::unordered_map<std::string, std::string> metadata,
+    bool page_align);
+MLX_API void save_safetensors(
+    std::string file,
+    std::vector<std::pair<std::string, array>> arrays,
+    std::unordered_map<std::string, std::string> metadata,
+    bool page_align);
 
 /** Load array map and metadata from .gguf file format */
 

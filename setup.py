@@ -49,6 +49,11 @@ def get_version():
             .decode()
         )
         version = f"{version}+{git_hash}"
+    # A local version label for fork builds, e.g. 0.32.4+serving.<hash>, that
+    # still satisfies requirements such as mlx==0.32.4.
+    local_label = os.environ.get("MLX_LOCAL_VERSION")
+    if local_label and "+" not in version:
+        version = f"{version}+{local_label}"
 
     return version
 

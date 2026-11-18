@@ -217,6 +217,14 @@ inline bool residency_debug() {
   return residency_debug_;
 }
 
+// Default for zero-copy safetensors loading (load_safetensors from a path):
+// tensors that start on a page boundary and span whole pages are mapped from
+// the file instead of being read into new buffers.
+inline bool zero_copy_load() {
+  static bool zero_copy_load_ = get_var("MLX_ZERO_COPY_LOAD", 0);
+  return zero_copy_load_;
+}
+
 inline bool metal_fast_synch() {
   static bool metal_fast_synch = get_var("MLX_METAL_FAST_SYNCH", 0);
   return metal_fast_synch;
