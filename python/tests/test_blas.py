@@ -975,6 +975,8 @@ class TestBlas(mlx_tests.MLXTestCase):
         np.random.seed(0)
         shapes = [(1, 32, 64), (7, 33, 65), (16, 128, 32), (17, 768, 512)]
         shapes += [(63, 63, 31), (64, 1, 33), (129, 7, 17), (300, 200, 1000)]
+        # with TF32 these take a float32 copy instead of the mixed kernel
+        shapes += [(1100, 72, 96), (24, 1100, 96)]
         for tf32 in (0, 1):
             for ta, tb in self.MIXED_FLOAT_PAIRS:
                 both = ta != mx.float32 and tb != mx.float32

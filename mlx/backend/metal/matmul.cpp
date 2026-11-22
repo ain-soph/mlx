@@ -159,6 +159,12 @@ bool mixed_nax_matmul(
   // exact float32 where float32 inputs take gemv (M == 1 or N == 1).
   const bool relaxed = env::enable_tf32() && std::min(M, N) > 1 &&
       (a.dtype() == float32 || b.dtype() == float32);
+  // With TF32 the float32 NAX GEMM on a float32 copy of the 16-bit operand is
+  // faster once the float32 operand has 1024 or more rows (columns for b):
+  // the copy then costs less than the slower mixed kernel.
+  if (relaxed && (a.dtype() == float32 ? M : N) >= 1024) {
+    return false;
+  }
   const bool has_batch = (batch_size_out > 1);
   const bool use_out_source = (c_opt != nullptr) && (beta != 0.0f);
   const bool do_axpby =
@@ -488,12 +494,13 @@ void prepare_promoted_mixed_matmul(
     if (orig.dtype() == out_dtype) {
       return orig;
     }
+    // Keep the layout of a dense input (e.g. a transposed weight) so the
+    // GEMM sees the same transposes as after an astype in the op.
     array tmp(orig.shape(), out_dtype, nullptr, {});
-    tmp.set_data(allocator::malloc(tmp.nbytes()));
     copy_gpu(
         orig,
         tmp,
-        orig.flags().row_contiguous ? CopyType::Vector : CopyType::General,
+        orig.flags().contiguous ? CopyType::Vector : CopyType::General,
         s);
     copies.push_back(tmp);
     return tmp;
