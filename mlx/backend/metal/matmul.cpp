@@ -245,7 +245,7 @@ void steel_matmul_regular_axpby_nax(
   std::string base_name = kname.str();
 
   const bool has_batch = (batch_shape.size() > 1);
-  const bool use_out_source = CHECK_AB && (alpha != 0.0f || beta != 1.0f);
+  const bool use_out_source = CHECK_AB && (alpha != 1.0f || beta != 0.0f);
   const bool do_axpby = use_out_source && (alpha != 1.0f || beta != 1.0f);
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
@@ -406,7 +406,7 @@ void steel_matmul_regular_axpby(
   std::string base_name = kname.str();
 
   const bool has_batch = (batch_shape.size() > 1);
-  const bool use_out_source = CHECK_AB && (alpha != 0.0f || beta != 1.0f);
+  const bool use_out_source = CHECK_AB && (alpha != 1.0f || beta != 0.0f);
   const bool do_axpby = use_out_source && (alpha != 1.0f || beta != 1.0f);
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
@@ -1000,7 +1000,7 @@ void steel_matmul_axpby(
     kname << "steel_gemm_thin_nax_n" << (transpose_b ? 't' : 'n') << "_"
           << type_to_name(out) << "_um2_un2_sm1_sn" << sn << "_ks" << ks;
     auto base_name = kname.str();
-    bool use_out_source = CHECK_AB && (alpha != 0.0f || beta != 1.0f);
+    bool use_out_source = CHECK_AB && (alpha != 1.0f || beta != 0.0f);
     bool do_axpby = use_out_source && (alpha != 1.0f || beta != 1.0f);
     bool align_M = M % 32 == 0, align_N = N % (32 * sn) == 0;
     bool align_K = K % 64 == 0;

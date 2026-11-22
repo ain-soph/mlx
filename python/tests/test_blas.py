@@ -1,5 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
+import itertools
 import math
 
 import mlx.core as mx
@@ -870,6 +871,24 @@ class TestBlas(mlx_tests.MLXTestCase):
             out = mx.addmm(c, a, b, alpha=0.5, beta=2.0)
             expected = 0.5 * (a @ b) + 2.0 * c
             self.assertTrue(mx.allclose(out, expected, rtol=tol, atol=tol))
+
+    def test_addmm_alpha_beta(self):
+        # Every alpha/beta pair, on shapes that reach the gemv, GEMM, split-K
+        # and thin-N kernels. alpha = 0 must still add beta * c.
+        np.random.seed(0)
+        shapes = [(1, 64, 64), (64, 64, 64), (33, 47, 65), (128, 128, 512)]
+        shapes += [(64, 32, 4096), (2048, 2048, 64), (4096, 32, 64)]
+        for (M, N, K), dtype in itertools.product(shapes, ("float32", "float16")):
+            a = np.random.normal(0.0, K**-0.5, (M, K)).astype(dtype)
+            b = np.random.normal(0.0, 1.0, (K, N)).astype(dtype)
+            c = np.random.normal(0.0, 1.0, (M, N)).astype(dtype)
+            ab = a.astype(np.float32) @ b.astype(np.float32)
+            for alpha, beta in ((0.0, 1.0), (0.0, 0.5), (1.0, 0.0), (0.5, 2.0)):
+                with self.subTest(shape=(M, N, K), dtype=dtype, alpha=alpha, beta=beta):
+                    out = mx.addmm(mx.array(c), mx.array(a), mx.array(b), alpha, beta)
+                    ref = alpha * ab + beta * c.astype(np.float32)
+                    tol = 1e-4 if dtype == "float32" else 2e-2
+                    self.assertTrue(np.allclose(out, ref, tol, tol))
 
     def test_wide_addmm(self):
         if mx.default_device() == mx.cpu:
