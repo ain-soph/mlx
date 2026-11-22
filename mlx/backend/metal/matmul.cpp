@@ -1,7 +1,9 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <fmt/format.h>
 #include <algorithm>
 #include <cassert>
+#include <climits>
 #include <numeric>
 #include <optional>
 #include <sstream>
@@ -80,6 +82,452 @@ ensure_batch_contiguous(const array& x, metal::Device& d, const Stream& s) {
   array x_copy = contiguous_copy_gpu(x, s);
   metal::get_command_encoder(s).add_temporary(x_copy);
   return std::make_tuple(false, x_copy.strides()[x_copy.ndim() - 2], x_copy);
+}
+
+const char* mixed_mpp_type_name(Dtype d) {
+  switch (d) {
+    case float32:
+      return "float";
+    case bfloat16:
+      return "bfloat";
+    case float16:
+      return "half";
+    default:
+      return "";
+  }
+}
+
+struct MixedGEMMParams {
+  int64_t batch_stride_d;
+  int M;
+  int N;
+  int K;
+  int lda;
+  int ldb;
+  int ldc;
+  int fdc;
+  int batch_ndim;
+  float alpha;
+  float beta;
+};
+
+bool mixed_nax_matmul(
+    const Stream& s,
+    metal::Device& d,
+    const array& a,
+    const array& b,
+    const array* c_opt,
+    array& out,
+    int M,
+    int N,
+    int K,
+    int batch_size_out,
+    int lda,
+    int ldb,
+    bool transpose_a,
+    bool transpose_b,
+    std::vector<array>& copies,
+    const Shape& batch_shape,
+    const Strides& A_batch_stride,
+    const Strides& B_batch_stride,
+    const Strides& C_batch_stride,
+    float alpha,
+    float beta) {
+  if (!metal::is_nax_available() || out.dtype() != float32 ||
+      a.dtype() == b.dtype()) {
+    return false;
+  }
+  const char* ta_str = mixed_mpp_type_name(a.dtype());
+  const char* tb_str = mixed_mpp_type_name(b.dtype());
+  if (ta_str[0] == '\0' || tb_str[0] == '\0') {
+    return false;
+  }
+  if (lda <= 0 || ldb <= 0) {
+    return false;
+  }
+  int64_t a_span = int64_t(transpose_a ? K : M) * lda;
+  int64_t b_span = int64_t(transpose_b ? N : K) * ldb;
+  if (a_span > INT_MAX || b_span > INT_MAX) {
+    return false;
+  }
+
+  const int bm = (M < 64) ? 16 : 64;
+  const int bn = 64;
+  const int bk = 32;
+
+  const bool relaxed =
+      env::enable_tf32() && (a.dtype() == float32 || b.dtype() == float32);
+  const bool has_batch = (batch_size_out > 1);
+  const bool use_out_source = (c_opt != nullptr) && (beta != 0.0f);
+  const bool do_axpby =
+      use_out_source ? (alpha != 1.0f || beta != 1.0f) : (alpha != 1.0f);
+
+  std::string lib_name;
+  concatenate(
+      lib_name,
+      "mixed_nax_gemm_",
+      transpose_a ? 't' : 'n',
+      transpose_b ? 't' : 'n',
+      "_",
+      type_to_name(a),
+      "_",
+      type_to_name(b),
+      "_bm",
+      bm,
+      "_bn",
+      bn,
+      "_bk",
+      bk,
+      relaxed ? "_r1" : "_r0");
+
+  auto lib = d.get_library(lib_name, [&]() {
+    return fmt::format(
+        R"(#include <metal_stdlib>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+
+constant bool has_batch [[function_constant(10)]];
+constant bool use_out_source [[function_constant(100)]];
+constant bool do_axpby [[function_constant(110)]];
+
+using TA = {0};
+using TB = {1};
+constant constexpr bool TRANSPOSE_A = {2};
+constant constexpr bool TRANSPOSE_B = {3};
+constant constexpr int BM = {4};
+constant constexpr int BN = {5};
+constant constexpr int BK = {6};
+constant constexpr bool RELAXED = {7};
+
+struct MixedGEMMParams {{
+  int64_t batch_stride_d;
+  int M;
+  int N;
+  int K;
+  int lda;
+  int ldb;
+  int ldc;
+  int fdc;
+  int batch_ndim;
+  float alpha;
+  float beta;
+}};
+
+inline int64_t mixed_batch_offset(
+    uint elem,
+    constant const int* shape,
+    constant const int64_t* strides,
+    int ndim) {{
+  int64_t off = 0;
+  for (int d = ndim - 1; d >= 0 && elem > 0; --d) {{
+    off += int64_t(elem % shape[d]) * strides[d];
+    elem /= shape[d];
+  }}
+  return off;
+}}
+
+[[kernel, max_total_threads_per_threadgroup(128)]] void mixed_nax_gemm(
+    const device TA* A [[buffer(0)]],
+    const device TB* B [[buffer(1)]],
+    const device float* C [[buffer(2), function_constant(use_out_source)]],
+    device float* D [[buffer(3)]],
+    constant const MixedGEMMParams* params [[buffer(4)]],
+    constant const int* batch_shape [[buffer(5), function_constant(has_batch)]],
+    constant const int64_t* batch_strides [[buffer(6), function_constant(has_batch)]],
+    uint3 tid [[threadgroup_position_in_grid]]) {{
+  if (has_batch) {{
+    A += mixed_batch_offset(tid.z, batch_shape, batch_strides, params->batch_ndim);
+    B += mixed_batch_offset(
+        tid.z, batch_shape, batch_strides + params->batch_ndim, params->batch_ndim);
+    if (use_out_source) {{
+      C += mixed_batch_offset(
+          tid.z, batch_shape, batch_strides + 2 * params->batch_ndim, params->batch_ndim);
+    }}
+  }}
+  D += int64_t(tid.z) * params->batch_stride_d;
+
+  const int M = params->M;
+  const int N = params->N;
+  const int K = params->K;
+  const int lda = params->lda;
+  const int ldb = params->ldb;
+
+  const int m_lo = int(tid.y) * BM;
+  const int n_lo = int(tid.x) * BN;
+  const int rows = min(BM, M - m_lo);
+  const int cols = min(BN, N - n_lo);
+  if (rows <= 0 || cols <= 0) {{
+    return;
+  }}
+
+  A += TRANSPOSE_A ? int64_t(m_lo) : int64_t(m_lo) * lda;
+  B += TRANSPOSE_B ? int64_t(n_lo) * ldb : int64_t(n_lo);
+  D += int64_t(m_lo) * N + n_lo;
+  if (use_out_source) {{
+    C += int64_t(m_lo) * params->ldc + int64_t(n_lo) * params->fdc;
+  }}
+
+  using extents_t = dextents<int32_t, 2>;
+  using strides_t = metal::array<int32_t, 2>;
+  using a_tensor_t = tensor<device TA, extents_t, tensor_inline>;
+  using b_tensor_t = tensor<device TB, extents_t, tensor_inline>;
+
+  constexpr auto desc = matmul2d_descriptor(
+      BM,
+      BN,
+      BK,
+      TRANSPOSE_A,
+      TRANSPOSE_B,
+      RELAXED,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<4>> op;
+
+  auto acc = op.template get_destination_cooperative_tensor<a_tensor_t, b_tensor_t, float>();
+  for (uint16_t i = 0; i < acc.get_capacity(); ++i) {{
+    acc[i] = 0.0f;
+  }}
+
+  const bool inside = (rows == BM) && (cols == BN);
+  if (inside) {{
+    a_tensor_t tA(
+        (device TA*)A,
+        TRANSPOSE_A ? extents_t(rows, K) : extents_t(K, rows),
+        strides_t{{1, lda}});
+    b_tensor_t tB(
+        (device TB*)B,
+        TRANSPOSE_B ? extents_t(K, cols) : extents_t(cols, K),
+        strides_t{{1, ldb}});
+    int k = 0;
+    for (; k + BK <= K; k += BK) {{
+      if constexpr (!TRANSPOSE_A && TRANSPOSE_B) {{
+        auto lhs = tA.template slice<BK, BM>(k, 0);
+        auto rhs = tB.template slice<BK, BN>(k, 0);
+        op.run(lhs, rhs, acc);
+      }} else if constexpr (!TRANSPOSE_A && !TRANSPOSE_B) {{
+        auto lhs = tA.template slice<BK, BM>(k, 0);
+        auto rhs = tB.template slice<BN, BK>(0, k);
+        op.run(lhs, rhs, acc);
+      }} else if constexpr (TRANSPOSE_A && TRANSPOSE_B) {{
+        auto lhs = tA.template slice<BM, BK>(0, k);
+        auto rhs = tB.template slice<BK, BN>(k, 0);
+        op.run(lhs, rhs, acc);
+      }} else {{
+        auto lhs = tA.template slice<BM, BK>(0, k);
+        auto rhs = tB.template slice<BN, BK>(0, k);
+        op.run(lhs, rhs, acc);
+      }}
+    }}
+    if (k < K) {{
+      const int kk = K - k;
+      a_tensor_t vA(
+          (device TA*)(A + (TRANSPOSE_A ? int64_t(k) * lda : int64_t(k))),
+          TRANSPOSE_A ? extents_t(rows, kk) : extents_t(kk, rows),
+          strides_t{{1, lda}});
+      b_tensor_t vB(
+          (device TB*)(B + (TRANSPOSE_B ? int64_t(k) : int64_t(k) * ldb)),
+          TRANSPOSE_B ? extents_t(kk, cols) : extents_t(cols, kk),
+          strides_t{{1, ldb}});
+      op.run(vA, vB, acc);
+    }}
+  }} else {{
+    for (int k = 0; k < K; k += BK) {{
+      const int kk = min(BK, K - k);
+      a_tensor_t vA(
+          (device TA*)(A + (TRANSPOSE_A ? int64_t(k) * lda : int64_t(k))),
+          TRANSPOSE_A ? extents_t(rows, kk) : extents_t(kk, rows),
+          strides_t{{1, lda}});
+      b_tensor_t vB(
+          (device TB*)(B + (TRANSPOSE_B ? int64_t(k) : int64_t(k) * ldb)),
+          TRANSPOSE_B ? extents_t(kk, cols) : extents_t(cols, kk),
+          strides_t{{1, ldb}});
+      op.run(vA, vB, acc);
+    }}
+  }}
+
+  if (use_out_source) {{
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {{
+      if (acc.is_valid_element(i)) {{
+        auto ids = acc.get_multidimensional_index(i);
+        const int n = ids[0];
+        const int m = ids[1];
+        if (m < rows && n < cols) {{
+          float c_val = C[int64_t(m) * params->ldc + int64_t(n) * params->fdc];
+          acc[i] = do_axpby ? (params->alpha * acc[i] + params->beta * c_val)
+                            : (acc[i] + c_val);
+        }}
+      }}
+    }}
+  }} else if (do_axpby) {{
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {{
+      acc[i] *= params->alpha;
+    }}
+  }}
+
+  if (inside) {{
+    tensor<device float, extents_t, tensor_inline> tD(
+        D, extents_t(cols, rows), strides_t{{1, N}});
+    auto d_slice = tD.template slice<BN, BM>(0, 0);
+    acc.store(d_slice);
+  }} else {{
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {{
+      if (acc.is_valid_element(i)) {{
+        auto ids = acc.get_multidimensional_index(i);
+        const int n = ids[0];
+        const int m = ids[1];
+        if (m < rows && n < cols) {{
+          D[int64_t(m) * N + n] = acc[i];
+        }}
+      }}
+    }}
+  }}
+}}
+)",
+        ta_str,
+        tb_str,
+        transpose_a ? "true" : "false",
+        transpose_b ? "true" : "false",
+        bm,
+        bn,
+        bk,
+        relaxed ? "true" : "false");
+  });
+
+  metal::MTLFCList func_consts = {
+      {&has_batch, MTL::DataType::DataTypeBool, 10},
+      {&use_out_source, MTL::DataType::DataTypeBool, 100},
+      {&do_axpby, MTL::DataType::DataTypeBool, 110},
+  };
+  std::string hash_name;
+  concatenate(
+      hash_name,
+      lib_name,
+      "_b",
+      has_batch ? 't' : 'n',
+      "_c",
+      use_out_source ? 't' : 'n',
+      "_a",
+      do_axpby ? 't' : 'n');
+
+  auto kernel = d.get_kernel("mixed_nax_gemm", lib, hash_name, func_consts);
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  int ldc = 0;
+  int fdc = 0;
+  if (use_out_source) {
+    ldc = c_opt->strides()[c_opt->ndim() - 2];
+    fdc = c_opt->strides()[c_opt->ndim() - 1];
+  }
+  MixedGEMMParams params{/* batch_stride_d = */ int64_t(M) * N,
+                         /* M = */ M,
+                         /* N = */ N,
+                         /* K = */ K,
+                         /* lda = */ lda,
+                         /* ldb = */ ldb,
+                         /* ldc = */ ldc,
+                         /* fdc = */ fdc,
+                         /* batch_ndim = */ int(batch_shape.size()),
+                         /* alpha = */ alpha,
+                         /* beta = */ beta};
+
+  compute_encoder.set_input_array(a, 0);
+  compute_encoder.set_input_array(b, 1);
+  if (use_out_source) {
+    compute_encoder.set_input_array(*c_opt, 2);
+  }
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(params, 4);
+
+  if (has_batch) {
+    Strides batch_strides = A_batch_stride;
+    batch_strides.insert(
+        batch_strides.end(), B_batch_stride.begin(), B_batch_stride.end());
+    if (use_out_source) {
+      batch_strides.insert(
+          batch_strides.end(), C_batch_stride.begin(), C_batch_stride.end());
+    }
+    compute_encoder.set_vector_bytes(batch_shape, 5);
+    compute_encoder.set_vector_bytes(batch_strides, 6);
+  }
+
+  const int tn = (N + bn - 1) / bn;
+  const int tm = (M + bm - 1) / bm;
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size(tn, tm, batch_size_out), MTL::Size(128, 1, 1));
+  compute_encoder.add_temporaries(std::move(copies));
+  return true;
+}
+
+void prepare_promoted_mixed_matmul(
+    const Stream& s,
+    const array& a_pre,
+    const array& b_pre,
+    const array* c_opt,
+    size_t out_size,
+    Dtype out_dtype,
+    std::vector<array>& copies,
+    array& a,
+    array& b,
+    bool& transpose_a,
+    bool& transpose_b,
+    int& M,
+    int& N,
+    int K,
+    int& lda,
+    int& ldb,
+    size_t& batch_size_out,
+    Shape& batch_shape,
+    Strides& A_batch_stride,
+    Strides& B_batch_stride,
+    Strides* C_batch_stride) {
+  auto promote_input = [&](const array& orig) {
+    if (orig.dtype() == out_dtype) {
+      return orig;
+    }
+    array tmp(orig.shape(), out_dtype, nullptr, {});
+    tmp.set_data(allocator::malloc(tmp.nbytes()));
+    copy_gpu(
+        orig,
+        tmp,
+        orig.flags().row_contiguous ? CopyType::Vector : CopyType::General,
+        s);
+    copies.push_back(tmp);
+    return tmp;
+  };
+  array a_prom = promote_input(a_pre);
+  array b_prom = promote_input(b_pre);
+  M = a_pre.shape(-2);
+  N = b_pre.shape(-1);
+  int64_t a_cols = 0;
+  int64_t b_cols = 0;
+  std::tie(transpose_a, a_cols, a) = check_transpose(copies, s, a_prom, M == 1);
+  std::tie(transpose_b, b_cols, b) = check_transpose(copies, s, b_prom, N == 1);
+  lda = static_cast<int>(a_cols);
+  ldb = static_cast<int>(b_cols);
+  if (c_opt != nullptr && C_batch_stride != nullptr) {
+    std::tie(batch_shape, A_batch_stride, B_batch_stride, *C_batch_stride) =
+        collapse_batches(a, b, *c_opt);
+  } else {
+    std::tie(batch_shape, A_batch_stride, B_batch_stride) =
+        collapse_batches(a, b);
+  }
+  batch_size_out = out_size / (size_t(M) * size_t(N));
+  if (batch_size_out > 1 && !transpose_a && batch_shape.size() == 1 &&
+      a.strides()[a.ndim() - 2] == K && A_batch_stride.back() == M * K &&
+      (c_opt == nullptr || C_batch_stride == nullptr ||
+       C_batch_stride->back() == M * c_opt->strides()[c_opt->ndim() - 2]) &&
+      B_batch_stride.back() == 0) {
+    M *= batch_shape.back();
+    batch_size_out = 1;
+    A_batch_stride = {0};
+    B_batch_stride = {0};
+    if (C_batch_stride != nullptr) {
+      *C_batch_stride = {0};
+    }
+    batch_shape = {1};
+  }
 }
 
 } // namespace
@@ -1563,7 +2011,7 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& b_pre = inputs[1];
   // Return 0s if either input is empty
   if (a_pre.size() == 0 || b_pre.size() == 0) {
-    array zero = array(0, a_pre.dtype());
+    array zero = array(0, out.dtype());
     fill_gpu(zero, out, s);
     compute_encoder.add_temporary(std::move(zero));
     return;
@@ -1601,6 +2049,59 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     A_batch_stride = {0};
     B_batch_stride = {0};
     batch_shape = {1};
+  }
+
+  if (a.dtype() != b.dtype()) {
+    if (mixed_nax_matmul(
+            s,
+            d,
+            a,
+            b,
+            nullptr,
+            out,
+            M,
+            N,
+            K,
+            static_cast<int>(batch_size_out),
+            static_cast<int>(a_cols),
+            static_cast<int>(b_cols),
+            a_transposed,
+            b_transposed,
+            copies,
+            batch_shape,
+            A_batch_stride,
+            B_batch_stride,
+            {},
+            1.0f,
+            0.0f)) {
+      return;
+    }
+    int lda_fallback = 0;
+    int ldb_fallback = 0;
+    prepare_promoted_mixed_matmul(
+        s,
+        a_pre,
+        b_pre,
+        nullptr,
+        out.size(),
+        out.dtype(),
+        copies,
+        a,
+        b,
+        a_transposed,
+        b_transposed,
+        M,
+        N,
+        K,
+        lda_fallback,
+        ldb_fallback,
+        batch_size_out,
+        batch_shape,
+        A_batch_stride,
+        B_batch_stride,
+        nullptr);
+    a_cols = lda_fallback;
+    b_cols = ldb_fallback;
   }
 
   /////////////////////////////////////////////////////////////////////////////
@@ -1770,6 +2271,57 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     B_batch_stride = {0};
     C_batch_stride = {0};
     batch_shape = {1};
+  }
+
+  if (a.dtype() != b.dtype()) {
+    if (mixed_nax_matmul(
+            s,
+            d,
+            a,
+            b,
+            &c,
+            out,
+            M,
+            N,
+            K,
+            static_cast<int>(batch_size_out),
+            lda,
+            ldb,
+            transpose_a,
+            transpose_b,
+            copies,
+            batch_shape,
+            A_batch_stride,
+            B_batch_stride,
+            C_batch_stride,
+            alpha_,
+            beta_)) {
+      return;
+    }
+    size_t promoted_batch_size = static_cast<size_t>(batch_size_out);
+    prepare_promoted_mixed_matmul(
+        s,
+        a_pre,
+        b_pre,
+        &c,
+        out.size(),
+        out.dtype(),
+        copies,
+        a,
+        b,
+        transpose_a,
+        transpose_b,
+        M,
+        N,
+        K,
+        lda,
+        ldb,
+        promoted_batch_size,
+        batch_shape,
+        A_batch_stride,
+        B_batch_stride,
+        &C_batch_stride);
+    batch_size_out = promoted_batch_size;
   }
 
   /////////////////////////////////////////////////////////////////////////////

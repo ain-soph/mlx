@@ -204,13 +204,17 @@ array matmul_vjp_a(
     const array& b,
     const std::vector<int>& reorder,
     Stream s) {
-  if (is_transposed_matrix(a)) {
-    // (b.conj() @ cotan.T).T
-    return transpose(
-        matmul(conjugate(b, s), transpose(cotan, reorder, s), s), reorder, s);
-  }
-  // M X N * (K X N).T -> M X K
-  return matmul(cotan, transpose(conjugate(b, s), reorder, s), s);
+  array vjp = is_transposed_matrix(a)
+      // (b.conj() @ cotan.T).T
+      ? transpose(
+            matmul(conjugate(b, s), transpose(cotan, reorder, s), s),
+            reorder,
+            s)
+      // M X N * (K X N).T -> M X K
+      : matmul(cotan, transpose(conjugate(b, s), reorder, s), s);
+  // a and b may have different float types (see matmul), so the gradient is
+  // cast back to the type of a.
+  return astype(vjp, a.dtype(), s);
 }
 
 array matmul_vjp_b(
@@ -219,13 +223,15 @@ array matmul_vjp_b(
     const array& b,
     const std::vector<int>& reorder,
     Stream s) {
-  if (is_transposed_matrix(b)) {
-    // (cotan.T @ a.conj()).T
-    return transpose(
-        matmul(transpose(cotan, reorder, s), conjugate(a, s), s), reorder, s);
-  }
-  // (M X K).T * M X N -> K X N
-  return matmul(transpose(conjugate(a, s), reorder, s), cotan, s);
+  array vjp = is_transposed_matrix(b)
+      // (cotan.T @ a.conj()).T
+      ? transpose(
+            matmul(transpose(cotan, reorder, s), conjugate(a, s), s),
+            reorder,
+            s)
+      // (M X K).T * M X N -> K X N
+      : matmul(transpose(conjugate(a, s), reorder, s), cotan, s);
+  return astype(vjp, b.dtype(), s);
 }
 
 } // namespace
