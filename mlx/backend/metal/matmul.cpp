@@ -155,8 +155,10 @@ bool mixed_nax_matmul(
   const int bn = 64;
   const int bk = 32;
 
-  const bool relaxed =
-      env::enable_tf32() && (a.dtype() == float32 || b.dtype() == float32);
+  // Same precision rule as for float32 inputs: TF32 on the NAX GEMM paths,
+  // exact float32 where float32 inputs take gemv (M == 1 or N == 1).
+  const bool relaxed = env::enable_tf32() && std::min(M, N) > 1 &&
+      (a.dtype() == float32 || b.dtype() == float32);
   const bool has_batch = (batch_size_out > 1);
   const bool use_out_source = (c_opt != nullptr) && (beta != 0.0f);
   const bool do_axpby =
