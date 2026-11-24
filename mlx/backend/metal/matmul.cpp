@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <climits>
+#include <cmath>
+#include <cstdlib>
 #include <numeric>
 #include <optional>
 #include <sstream>
@@ -80,6 +83,108 @@ ensure_batch_contiguous(const array& x, metal::Device& d, const Stream& s) {
   array x_copy = contiguous_copy_gpu(x, s);
   metal::get_command_encoder(s).add_temporary(x_copy);
   return std::make_tuple(false, x_copy.strides()[x_copy.ndim() - 2], x_copy);
+}
+
+// True when check_transpose can use arr without a copy.
+bool has_matrix_layout(const array& arr, bool is_vector) {
+  auto stx = arr.strides()[arr.ndim() - 2];
+  auto sty = arr.strides()[arr.ndim() - 1];
+  return (sty == 1 && (!is_vector || stx == arr.shape(-1))) ||
+      (stx == 1 && (!is_vector || sty == arr.shape(-2)));
+}
+
+int64_t predict_check_transpose_ld(const array& arr, bool is_vector) {
+  auto stx = arr.strides()[arr.ndim() - 2];
+  auto sty = arr.strides()[arr.ndim() - 1];
+  if (sty == 1 && (!is_vector || stx == arr.shape(-1))) {
+    return stx;
+  }
+  if (stx == 1 && (!is_vector || sty == arr.shape(-2))) {
+    return sty;
+  }
+  return arr.shape(-1);
+}
+
+// Batched gemv kernels compute batch offsets with 32-bit elem_to_loc.
+bool batch_offsets_fit_uint32(const array& x) {
+  int64_t span = 0;
+  for (int i = 0; i < static_cast<int>(x.ndim()) - 2; ++i) {
+    int64_t stride = x.strides()[i];
+    if (x.shape(i) <= 1) {
+      continue;
+    }
+    if (stride < 0 || stride > UINT_MAX ||
+        int64_t(x.shape(i) - 1) * stride > UINT_MAX - span) {
+      return false;
+    }
+    span += int64_t(x.shape(i) - 1) * stride;
+  }
+  return true;
+}
+
+// Mixed kernels use 32-bit offsets (up to BK * ld with BK <= 512).
+constexpr int64_t kMixedMaxLd = INT_MAX / 512;
+
+bool is_supported_mixed_float(Dtype d) {
+  return d == float32 || d == bfloat16 || d == float16;
+}
+
+// If this returns false, the caller casts the narrow input to the output
+// type. That is the same AsType copy that main does, so main kernels run.
+bool can_use_mixed_metal(
+    const array& a_pre,
+    const array& b_pre,
+    const array* c_opt,
+    const array& out,
+    int M,
+    int N) {
+  if (!metal::is_nax_available() || out.dtype() != float32 ||
+      a_pre.dtype() == b_pre.dtype()) {
+    return false;
+  }
+  if (!is_supported_mixed_float(a_pre.dtype()) ||
+      !is_supported_mixed_float(b_pre.dtype())) {
+    return false;
+  }
+  int64_t lda64 = predict_check_transpose_ld(a_pre, M == 1);
+  int64_t ldb64 = predict_check_transpose_ld(b_pre, N == 1);
+  if (lda64 < 0 || lda64 > kMixedMaxLd || ldb64 < 0 || ldb64 > kMixedMaxLd ||
+      N > kMixedMaxLd) {
+    return false;
+  }
+  if (std::max(a_pre.ndim(), b_pre.ndim()) > 3 &&
+      (!batch_offsets_fit_uint32(a_pre) || !batch_offsets_fit_uint32(b_pre))) {
+    return false;
+  }
+  if (c_opt != nullptr && c_opt->ndim() >= 1) {
+    // gemv_wide indexes the bias with int64 rows and int columns.
+    int64_t ldc64 =
+        c_opt->ndim() >= 2 ? c_opt->strides()[c_opt->ndim() - 2] : 0;
+    int64_t fdc64 = c_opt->strides()[c_opt->ndim() - 1];
+    if (ldc64 < -INT_MAX || ldc64 > INT_MAX || fdc64 < -INT_MAX ||
+        fdc64 > INT_MAX || int64_t(N) * std::abs(fdc64) > INT_MAX) {
+      return false;
+    }
+  }
+  return true;
+}
+
+array promote_once_for_fallback(
+    const Stream& s,
+    const array& orig,
+    Dtype out_dtype,
+    bool is_vector,
+    std::vector<array>& copies) {
+  if (orig.dtype() == out_dtype) {
+    return orig;
+  }
+  // Keep the layout only if check_transpose will not copy it again.
+  bool keep_layout =
+      orig.flags().contiguous && has_matrix_layout(orig, is_vector);
+  array tmp(orig.shape(), out_dtype, nullptr, {});
+  copy_gpu(orig, tmp, keep_layout ? CopyType::Vector : CopyType::General, s);
+  copies.push_back(tmp);
+  return tmp;
 }
 
 } // namespace
@@ -203,13 +308,36 @@ void steel_matmul_regular_axpby_nax(
     float beta /* = 0.0f */) {
   using namespace mlx::steel;
 
+  const bool is_mixed = (a.dtype() != b.dtype());
+  const bool relaxed =
+      env::enable_tf32() && (a.dtype() == float32 || b.dtype() == float32);
+
   // Determine dispatch kernel
   int bm = 128, bn = 128, bk = 512;
   int wm = 4, wn = 4;
 
   // Temp routing for larger devices
   char devc = d.get_architecture().back();
-  if (devc == 's' || devc == 'c') {
+  // Mixed types: small tiles for few rows or small outputs.
+  if (is_mixed && M <= 16) {
+    bm = 16;
+    bn = 32;
+    bk = 256;
+    wm = 1;
+    wn = 1;
+  } else if (is_mixed && M <= 64 && N <= 1024) {
+    bm = 32;
+    bn = 32;
+    bk = 256;
+    wm = 1;
+    wn = 1;
+  } else if (is_mixed && (M <= 64 || int64_t(M) * N <= 1024LL * 1024)) {
+    bm = 64;
+    bn = 64;
+    bk = 256;
+    wm = 2;
+    wn = 2;
+  } else if (devc == 's' || devc == 'c') {
     bk = (K >= 8192 && K > (M + N)) ? 64 : 256;
 
     bm = 64;
@@ -234,13 +362,25 @@ void steel_matmul_regular_axpby_nax(
   std::ostringstream kname;
 
   // clang-format off
-  kname << "steel_gemm_fused_nax_"
-        << (transpose_a ? 't' : 'n')
-        << (transpose_b ? 't' : 'n')
-        << "_" << type_to_name(a)
-        << "_" << type_to_name(out)
-        << "_bm" << bm << "_bn" << bn << "_bk" << bk
-        << "_wm" << wm << "_wn" << wn; // clang-format on
+  if (is_mixed) {
+    kname << "steel_gemm_fused_nax_mixed_"
+          << (transpose_a ? 't' : 'n')
+          << (transpose_b ? 't' : 'n')
+          << "_" << type_to_name(a)
+          << "_" << type_to_name(b)
+          << "_" << type_to_name(out)
+          << "_bm" << bm << "_bn" << bn << "_bk" << bk
+          << "_wm" << wm << "_wn" << wn
+          << "_r" << (relaxed ? 1 : 0);
+  } else {
+    kname << "steel_gemm_fused_nax_"
+          << (transpose_a ? 't' : 'n')
+          << (transpose_b ? 't' : 'n')
+          << "_" << type_to_name(a)
+          << "_" << type_to_name(out)
+          << "_bm" << bm << "_bn" << bn << "_bk" << bk
+          << "_wm" << wm << "_wn" << wn;
+  } // clang-format on
 
   std::string base_name = kname.str();
 
@@ -272,19 +412,36 @@ void steel_matmul_regular_axpby_nax(
 
   // Encode and dispatch kernel
   auto& compute_encoder = metal::get_command_encoder(s);
-  auto kernel = get_steel_gemm_fused_nax_kernel(
-      /* metal::Device& d = */ d,
-      /* const std::string& kernel_name = */ base_name,
-      /* const std::string& hash_name = */ hash_name,
-      /* const metal::MTLFCList& func_consts = */ func_consts,
-      /* const array& out = */ out,
-      /* bool transpose_a = */ transpose_a,
-      /* bool transpose_b = */ transpose_b,
-      /* int bm = */ bm,
-      /* int bn = */ bn,
-      /* int bk = */ bk,
-      /* int wm = */ wm,
-      /* int wn = */ wn);
+  auto kernel = is_mixed
+      ? get_steel_gemm_fused_nax_mixed_kernel(
+            d,
+            base_name,
+            hash_name,
+            func_consts,
+            a,
+            b,
+            out,
+            transpose_a,
+            transpose_b,
+            bm,
+            bn,
+            bk,
+            wm,
+            wn,
+            relaxed)
+      : get_steel_gemm_fused_nax_kernel(
+            /* metal::Device& d = */ d,
+            /* const std::string& kernel_name = */ base_name,
+            /* const std::string& hash_name = */ hash_name,
+            /* const metal::MTLFCList& func_consts = */ func_consts,
+            /* const array& out = */ out,
+            /* bool transpose_a = */ transpose_a,
+            /* bool transpose_b = */ transpose_b,
+            /* int bm = */ bm,
+            /* int bn = */ bn,
+            /* int bk = */ bk,
+            /* int wm = */ wm,
+            /* int wn = */ wn);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -297,7 +454,7 @@ void steel_matmul_regular_axpby_nax(
   if (devc == 's' || devc == 'c') {
     swizzle_log = 2;
   } else if (devc == 'd') {
-    swizzle_log = (M > N) ? 0 : 2;
+    swizzle_log = (is_mixed && tm <= 3) ? 0 : ((M > N) ? 0 : 2);
   }
 
   // Prepare steel matmul params
@@ -391,17 +548,30 @@ void steel_matmul_regular_axpby(
   char devc = d.get_architecture().back();
   GEMM_TPARAM_MACRO(devc)
 
+  const bool is_mixed = (a.dtype() != b.dtype());
+
   // Prepare kernel name
   std::ostringstream kname;
 
   // clang-format off
-  kname << "steel_gemm_fused_"
-        << (transpose_a ? 't' : 'n')
-        << (transpose_b ? 't' : 'n')
-        << "_" << type_to_name(a)
-        << "_" << type_to_name(out)
-        << "_bm" << bm << "_bn" << bn << "_bk" << bk
-        << "_wm" << wm << "_wn" << wn; // clang-format on
+  if (is_mixed) {
+    kname << "steel_gemm_fused_mixed_"
+          << (transpose_a ? 't' : 'n')
+          << (transpose_b ? 't' : 'n')
+          << "_" << type_to_name(a)
+          << "_" << type_to_name(b)
+          << "_" << type_to_name(out)
+          << "_bm" << bm << "_bn" << bn << "_bk" << bk
+          << "_wm" << wm << "_wn" << wn;
+  } else {
+    kname << "steel_gemm_fused_"
+          << (transpose_a ? 't' : 'n')
+          << (transpose_b ? 't' : 'n')
+          << "_" << type_to_name(a)
+          << "_" << type_to_name(out)
+          << "_bm" << bm << "_bn" << bn << "_bk" << bk
+          << "_wm" << wm << "_wn" << wn;
+  } // clang-format on
 
   std::string base_name = kname.str();
 
@@ -433,19 +603,35 @@ void steel_matmul_regular_axpby(
 
   // Encode and dispatch kernel
   auto& compute_encoder = metal::get_command_encoder(s);
-  auto kernel = get_steel_gemm_fused_kernel(
-      /* metal::Device& d = */ d,
-      /* const std::string& kernel_name = */ base_name,
-      /* const std::string& hash_name = */ hash_name,
-      /* const metal::MTLFCList& func_consts = */ func_consts,
-      /* const array& out = */ out,
-      /* bool transpose_a = */ transpose_a,
-      /* bool transpose_b = */ transpose_b,
-      /* int bm = */ bm,
-      /* int bn = */ bn,
-      /* int bk = */ bk,
-      /* int wm = */ wm,
-      /* int wn = */ wn);
+  auto kernel = is_mixed
+      ? get_steel_gemm_fused_mixed_kernel(
+            d,
+            base_name,
+            hash_name,
+            func_consts,
+            a,
+            b,
+            out,
+            transpose_a,
+            transpose_b,
+            bm,
+            bn,
+            bk,
+            wm,
+            wn)
+      : get_steel_gemm_fused_kernel(
+            /* metal::Device& d = */ d,
+            /* const std::string& kernel_name = */ base_name,
+            /* const std::string& hash_name = */ hash_name,
+            /* const metal::MTLFCList& func_consts = */ func_consts,
+            /* const array& out = */ out,
+            /* bool transpose_a = */ transpose_a,
+            /* bool transpose_b = */ transpose_b,
+            /* int bm = */ bm,
+            /* int bn = */ bn,
+            /* int bk = */ bk,
+            /* int wm = */ wm,
+            /* int wn = */ wn);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -561,37 +747,67 @@ void steel_gemm_splitk_axpby(
   C_split.set_data(allocator::malloc(C_split.nbytes()));
   copies.push_back(C_split);
 
+  const bool is_mixed = (a.dtype() != b.dtype());
   bool mn_aligned = M % bm == 0 && N % bn == 0;
   bool k_aligned = K % bk == 0;
   std::ostringstream kname;
 
   // clang-format off
-  kname << "steel_gemm_splitk_"
-        << (transpose_a ? 't' : 'n')
-        << (transpose_b ? 't' : 'n')
-        << "_" << type_to_name(a)
-        << "_" << type_to_name(C_split)
-        << "_bm" << bm << "_bn" << bn << "_bk" << bk
-        << "_wm" << wm << "_wn" << wn
-        << "_MN_" << (mn_aligned ? "t" : "n") << "aligned"
-        << "_K_" << (k_aligned ? "t" : "n") << "aligned"; // clang-format on
+  if (is_mixed) {
+    kname << "steel_gemm_splitk_mixed_"
+          << (transpose_a ? 't' : 'n')
+          << (transpose_b ? 't' : 'n')
+          << "_" << type_to_name(a)
+          << "_" << type_to_name(b)
+          << "_" << type_to_name(C_split)
+          << "_bm" << bm << "_bn" << bn << "_bk" << bk
+          << "_wm" << wm << "_wn" << wn
+          << "_MN_" << (mn_aligned ? "t" : "n") << "aligned"
+          << "_K_" << (k_aligned ? "t" : "n") << "aligned";
+  } else {
+    kname << "steel_gemm_splitk_"
+          << (transpose_a ? 't' : 'n')
+          << (transpose_b ? 't' : 'n')
+          << "_" << type_to_name(a)
+          << "_" << type_to_name(C_split)
+          << "_bm" << bm << "_bn" << bn << "_bk" << bk
+          << "_wm" << wm << "_wn" << wn
+          << "_MN_" << (mn_aligned ? "t" : "n") << "aligned"
+          << "_K_" << (k_aligned ? "t" : "n") << "aligned";
+  } // clang-format on
 
   // Encode and dispatch gemm kernel
   auto& compute_encoder = metal::get_command_encoder(s);
-  auto kernel = get_steel_gemm_splitk_kernel(
-      /* metal::Device& d = */ d,
-      /* const std::string& kernel_name = */ kname.str(),
-      /* const array& in = */ a,
-      /* const array& out = */ C_split,
-      /* bool transpose_a = */ transpose_a,
-      /* bool transpose_b = */ transpose_b,
-      /* int bm = */ bm,
-      /* int bn = */ bn,
-      /* int bk = */ bk,
-      /* int wm = */ wm,
-      /* int wn = */ wn,
-      /* bool mn_aligned = */ mn_aligned,
-      /* bool k_aligned = */ k_aligned);
+  auto kernel = is_mixed
+      ? get_steel_gemm_splitk_mixed_kernel(
+            d,
+            kname.str(),
+            a,
+            b,
+            C_split,
+            transpose_a,
+            transpose_b,
+            bm,
+            bn,
+            bk,
+            wm,
+            wn,
+            mn_aligned,
+            k_aligned)
+      : get_steel_gemm_splitk_kernel(
+            /* metal::Device& d = */ d,
+            /* const std::string& kernel_name = */ kname.str(),
+            /* const array& in = */ a,
+            /* const array& out = */ C_split,
+            /* bool transpose_a = */ transpose_a,
+            /* bool transpose_b = */ transpose_b,
+            /* int bm = */ bm,
+            /* int bn = */ bn,
+            /* int bk = */ bk,
+            /* int wm = */ wm,
+            /* int wn = */ wn,
+            /* bool mn_aligned = */ mn_aligned,
+            /* bool k_aligned = */ k_aligned);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -757,16 +973,26 @@ void steel_gemm_splitk_axpby_nax(
       {&align_M, MTL::DataType::DataTypeBool, 200},
       {&align_N, MTL::DataType::DataTypeBool, 201}};
 
+  const bool is_mixed = (a.dtype() != b.dtype());
+  const bool relaxed =
+      env::enable_tf32() && (a.dtype() == float32 || b.dtype() == float32);
+
   std::ostringstream kname;
 
   // clang-format off
-  kname << "steel_gemm_splitk_nax_"
+  kname << (is_mixed ? "steel_gemm_splitk_nax_mixed_" : "steel_gemm_splitk_nax_")
         << (transpose_a ? 't' : 'n')
         << (transpose_b ? 't' : 'n')
-        << "_" << type_to_name(a)
-        << "_" << type_to_name(C_split)
+        << "_" << type_to_name(a);
+  if (is_mixed) {
+    kname << "_" << type_to_name(b);
+  }
+  kname << "_" << type_to_name(C_split)
         << "_bm" << bm << "_bn" << bn << "_bk" << bk
-        << "_wm" << wm << "_wn" << wn; // clang-format on
+        << "_wm" << wm << "_wn" << wn;
+  if (is_mixed) {
+    kname << "_r" << (relaxed ? 1 : 0);
+  } // clang-format on
 
   std::string base_name = kname.str();
 
@@ -778,19 +1004,35 @@ void steel_gemm_splitk_axpby_nax(
   std::string hash_name = kname.str();
 
   auto& compute_encoder = metal::get_command_encoder(s);
-  auto kernel = get_steel_gemm_splitk_nax_kernel(
-      /* metal::Device& d = */ d,
-      /* const std::string& kernel_name = */ base_name,
-      /* const std::string& hash_name = */ hash_name,
-      /* const metal::MTLFCList& func_consts = */ func_consts,
-      /* const array& in = */ a,
-      /* bool transpose_a = */ transpose_a,
-      /* bool transpose_b = */ transpose_b,
-      /* int bm = */ bm,
-      /* int bn = */ bn,
-      /* int bk = */ bk,
-      /* int wm = */ wm,
-      /* int wn = */ wn);
+  auto kernel = is_mixed
+      ? get_steel_gemm_splitk_nax_mixed_kernel(
+            d,
+            base_name,
+            hash_name,
+            func_consts,
+            a,
+            b,
+            transpose_a,
+            transpose_b,
+            bm,
+            bn,
+            bk,
+            wm,
+            wn,
+            relaxed)
+      : get_steel_gemm_splitk_nax_kernel(
+            /* metal::Device& d = */ d,
+            /* const std::string& kernel_name = */ base_name,
+            /* const std::string& hash_name = */ hash_name,
+            /* const metal::MTLFCList& func_consts = */ func_consts,
+            /* const array& in = */ a,
+            /* bool transpose_a = */ transpose_a,
+            /* bool transpose_b = */ transpose_b,
+            /* int bm = */ bm,
+            /* int bn = */ bn,
+            /* int bk = */ bk,
+            /* int wm = */ wm,
+            /* int wn = */ wn);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -961,16 +1203,18 @@ void steel_matmul_axpby(
   int _tn = (N + 16 - 1) / 16;
   int _tk = K / 16;
   int64_t matrix_size = static_cast<int64_t>(M) * N;
+  const bool has_f32 = (a.dtype() == float32 || b.dtype() == float32);
   bool use_nax = metal::is_nax_available() &&
       !issubdtype(a.dtype(), complexfloating) &&
-      (env::enable_tf32() || a.dtype() != float32);
+      (env::enable_tf32() || !has_f32);
   char devc = d.get_architecture().back();
   int min_tmn_threshold = (devc == 's' || devc == 'd') ? 2048 : 1024;
 
   // Case 1: Small M×N with large K, use SIMD split-K
   // Max and Ultra dispatch larger sizes to splitk
-  if (!use_nax && batch_size_out == 1 && (_tm * _tn) <= min_tmn_threshold &&
-      _tk >= 8 && K >= std::max(M, N)) {
+  if (!use_nax && batch_size_out == 1 &&
+      int64_t(_tm) * _tn <= min_tmn_threshold && _tk >= 8 &&
+      K >= std::max(M, N)) {
     return steel_gemm_splitk_axpby<CHECK_AB>(
         /* const Stream& s = */ s,
         /* metal::Device& d = */ d,
@@ -1238,6 +1482,7 @@ void gemv_axbpy(
   int sm = 1, sn = 32;
   int bm = 1, bn = 1;
   int n_out_per_tgp;
+  const bool is_mixed = (mat.dtype() != vec.dtype());
   std::ostringstream kname;
 
   if (transpose_mat) {
@@ -1273,7 +1518,12 @@ void gemv_axbpy(
     }
 
     n_out_per_tgp = bn * sn * tn;
-    kname << "gemv_t_" << type_to_name(out);
+    if (is_mixed) {
+      kname << "gemv_mixed_t_" << type_to_name(mat) << "_" << type_to_name(vec)
+            << "_" << type_to_name(out);
+    } else {
+      kname << "gemv_t_" << type_to_name(out);
+    }
 
   } else {
     bm = out_vector_len >= 4096 ? 8 : 4;
@@ -1292,7 +1542,12 @@ void gemv_axbpy(
     tm = out_vector_len < tm ? 1 : tm;
 
     n_out_per_tgp = bm * sm * tm;
-    kname << "gemv_" << type_to_name(out);
+    if (is_mixed) {
+      kname << "gemv_mixed_" << type_to_name(mat) << "_" << type_to_name(vec)
+            << "_" << type_to_name(out);
+    } else {
+      kname << "gemv_" << type_to_name(out);
+    }
   }
 
   const bool do_axpby = CHECK_AB && (alpha != 1.0f || beta != 0.0f);
@@ -1306,19 +1561,34 @@ void gemv_axbpy(
 
   // Encode and dispatch kernel
   auto& compute_encoder = metal::get_command_encoder(s);
-  auto kernel = get_gemv_kernel(
-      d,
-      kname.str(),
-      out,
-      transpose_mat,
-      bm,
-      bn,
-      sm,
-      sn,
-      tm,
-      tn,
-      !contiguous_kernel,
-      do_axpby);
+  auto kernel = is_mixed ? get_gemv_mixed_kernel(
+                               d,
+                               kname.str(),
+                               mat,
+                               vec,
+                               out,
+                               transpose_mat,
+                               bm,
+                               bn,
+                               sm,
+                               sn,
+                               tm,
+                               tn,
+                               !contiguous_kernel,
+                               do_axpby)
+                         : get_gemv_kernel(
+                               d,
+                               kname.str(),
+                               out,
+                               transpose_mat,
+                               bm,
+                               bn,
+                               sm,
+                               sn,
+                               tm,
+                               tn,
+                               !contiguous_kernel,
+                               do_axpby);
   compute_encoder.set_compute_pipeline_state(kernel);
 
   int n_tgp = (out_vector_len + n_out_per_tgp - 1) / n_out_per_tgp;
@@ -1422,7 +1692,10 @@ inline std::optional<GemvWideConfig> gemv_wide_config(
     int64_t mat_offset,
     int64_t vec_offset,
     const Strides& mat_batch_stride,
-    const Strides& vec_batch_stride) {
+    const Strides& vec_batch_stride,
+    bool is_mixed = false,
+    int mat_itemsize = 2,
+    int vec_itemsize = 2) {
   // Pre-M3 generations are limited by load issue rate rather than
   // bandwidth and do not profit from the amortized stream; they keep the
   // existing kernels.
@@ -1437,14 +1710,16 @@ inline std::optional<GemvWideConfig> gemv_wide_config(
         });
   };
 
-  bool vec4_aligned = mat_offset % 8 == 0 && vec_offset % 8 == 0 &&
-      mat_ld % 4 == 0 && vec_ld % 4 == 0 && all_aligned(mat_batch_stride, 4) &&
+  bool vec4_aligned = mat_offset % (4 * mat_itemsize) == 0 &&
+      vec_offset % (4 * vec_itemsize) == 0 && mat_ld % 4 == 0 &&
+      vec_ld % 4 == 0 && all_aligned(mat_batch_stride, 4) &&
       all_aligned(vec_batch_stride, 4);
 
   // Wide amortizes one matrix stream over several vectors; M == 1 has
   // nothing to amortize and stays with gemv.
   if (M <= 1 || N <= 1 || K % 4 != 0 ||
-      (out.dtype() != float16 && out.dtype() != bfloat16) || !vec4_aligned) {
+      (!is_mixed && out.dtype() != float16 && out.dtype() != bfloat16) ||
+      (is_mixed && out.dtype() != float32) || !vec4_aligned) {
     return std::nullopt;
   }
 
@@ -1459,12 +1734,14 @@ inline std::optional<GemvWideConfig> gemv_wide_config(
   // Wide enough that the row grid alone saturates the GPU: N/4 threadgroups,
   // orders of magnitude beyond concurrent execution capacity.
   bool vocab_wide = N >= 65536;
+  bool large_mat =
+      is_mixed && (N >= 2048 || int64_t(N) * K * mat_itemsize >= (8LL << 20));
 
   // Full rows double the threads per group and halve each lane's K share
   // — more in flight where the grid is thinnest: one-pass tiles have a
   // single grid column, and tiny outputs starve every column.
-  bool full_simd = passes == 1 || N <= 64;
-  int grid_x = vocab_wide ? 1 : passes;
+  bool full_simd = passes == 1 || N <= 64 || large_mat;
+  int grid_x = (vocab_wide || large_mat) ? 1 : passes;
   return GemvWideConfig{(M + passes - 1) / passes, full_simd ? 32 : 16, grid_x};
 }
 
@@ -1488,6 +1765,7 @@ bool gemv_wide(
     const Strides* bias_batch_stride,
     float alpha,
     float beta) {
+  const bool is_mixed = (mat.dtype() != in_vec.dtype());
   auto plan = gemv_wide_config(
       d,
       out,
@@ -1499,7 +1777,10 @@ bool gemv_wide(
       mat.offset(),
       in_vec.offset(),
       mat_batch_stride,
-      vec_batch_stride);
+      vec_batch_stride,
+      is_mixed,
+      mat.itemsize(),
+      in_vec.itemsize());
   if (!plan) {
     return false;
   }
@@ -1511,7 +1792,16 @@ bool gemv_wide(
   MTL::Size group_dims(32, plan->k_lanes / 8, 1);
   MTL::Size grid_dims(plan->grid_x, (N + 3) / 4, batch_size_out);
 
-  std::string base_name = gemv_wide_kernel_name("gemv_wide_", out, *plan);
+  std::string base_name;
+  if (is_mixed) {
+    std::ostringstream kname;
+    kname << "gemv_wide_mixed_" << type_to_name(mat) << "_"
+          << type_to_name(in_vec) << "_" << type_to_name(out) << "_nv"
+          << plan->vecs_per_tg << "_kl" << plan->k_lanes;
+    base_name = kname.str();
+  } else {
+    base_name = gemv_wide_kernel_name("gemv_wide_", out, *plan);
+  }
   std::ostringstream hash_name;
   hash_name << base_name << "_nc" << has_batch << "_axpby" << do_axpby;
   metal::MTLFCList func_consts = {
@@ -1520,14 +1810,24 @@ bool gemv_wide(
   };
 
   auto& compute_encoder = metal::get_command_encoder(s);
-  auto kernel = get_gemv_wide_kernel(
-      d,
-      base_name,
-      hash_name.str(),
-      func_consts,
-      out,
-      plan->vecs_per_tg,
-      plan->k_lanes);
+  auto kernel = is_mixed ? get_gemv_wide_mixed_kernel(
+                               d,
+                               base_name,
+                               hash_name.str(),
+                               func_consts,
+                               mat,
+                               in_vec,
+                               out,
+                               plan->vecs_per_tg,
+                               plan->k_lanes)
+                         : get_gemv_wide_kernel(
+                               d,
+                               base_name,
+                               hash_name.str(),
+                               func_consts,
+                               out,
+                               plan->vecs_per_tg,
+                               plan->k_lanes);
   compute_encoder.set_compute_pipeline_state(kernel);
 
   compute_encoder.set_input_array(mat, 0);
@@ -1576,7 +1876,7 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& b_pre = inputs[1];
   // Return 0s if either input is empty
   if (a_pre.size() == 0 || b_pre.size() == 0) {
-    array zero = array(0, a_pre.dtype());
+    array zero = array(0, out.dtype());
     fill_gpu(zero, out, s);
     compute_encoder.add_temporary(std::move(zero));
     return;
@@ -1594,8 +1894,15 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Keep a vector with copies to be cleared in the completed buffer to release
   // the arrays
   std::vector<array> copies;
-  auto [a_transposed, a_cols, a] = check_transpose(copies, s, a_pre, M == 1);
-  auto [b_transposed, b_cols, b] = check_transpose(copies, s, b_pre, N == 1);
+  array a_in = a_pre;
+  array b_in = b_pre;
+  if (a_in.dtype() != b_in.dtype() &&
+      !can_use_mixed_metal(a_in, b_in, nullptr, out, M, N)) {
+    a_in = promote_once_for_fallback(s, a_in, out.dtype(), M == 1, copies);
+    b_in = promote_once_for_fallback(s, b_in, out.dtype(), N == 1, copies);
+  }
+  auto [a_transposed, a_cols, a] = check_transpose(copies, s, a_in, M == 1);
+  auto [b_transposed, b_cols, b] = check_transpose(copies, s, b_in, N == 1);
 
   /////////////////////////////////////////////////////////////////////////////
   // Check and collapse batch dimensions
@@ -1620,7 +1927,8 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Gemv specialization
 
   if (M == 1 && N == 1 && batch_size_out == 1 && a.flags().row_contiguous &&
-      b.flags().row_contiguous && a.dtype() != complex64) {
+      b.flags().row_contiguous && a.dtype() == b.dtype() &&
+      a.dtype() != complex64) {
     return dot_product(
         /* const Stream& s = */ s,
         /* metal::Device& d = */ d,
@@ -1755,8 +2063,15 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Keep a vector with copies to be cleared in the completed buffer to release
   // the arrays
   std::vector<array> copies;
-  auto [transpose_a, a_cols, a] = check_transpose(copies, s, a_pre, M == 1);
-  auto [transpose_b, b_cols, b] = check_transpose(copies, s, b_pre, N == 1);
+  array a_in = a_pre;
+  array b_in = b_pre;
+  if (a_in.dtype() != b_in.dtype() &&
+      !can_use_mixed_metal(a_in, b_in, &c_pre, out, M, N)) {
+    a_in = promote_once_for_fallback(s, a_in, out.dtype(), M == 1, copies);
+    b_in = promote_once_for_fallback(s, b_in, out.dtype(), N == 1, copies);
+  }
+  auto [transpose_a, a_cols, a] = check_transpose(copies, s, a_in, M == 1);
+  auto [transpose_b, b_cols, b] = check_transpose(copies, s, b_in, N == 1);
 
   array c = c_pre;
 

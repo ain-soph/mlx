@@ -19,10 +19,12 @@ template <
     int WN,
     bool transpose_a,
     bool transpose_b,
-    typename AccumType = float>
+    typename AccumType = float,
+    typename TB = T,
+    bool kRelaxed = true>
 [[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void gemm_splitk_nax(
     const device T* A [[buffer(0)]],
-    const device T* B [[buffer(1)]],
+    const device TB* B [[buffer(1)]],
     device AccumType* C [[buffer(2)]],
     const constant GEMMSpiltKParams* params [[buffer(3)]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -119,7 +121,9 @@ template <
             kAlignedM.value,
             kAlignedN.value,
             kAlignedK.value,
-            AccumType>(
+            AccumType,
+            TB,
+            kRelaxed>(
             A,
             B,
             params->lda,

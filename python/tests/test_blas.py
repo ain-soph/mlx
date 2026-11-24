@@ -1,6 +1,9 @@
 # Copyright © 2023-2024 Apple Inc.
 
+import itertools
 import math
+import os
+import tempfile
 
 import mlx.core as mx
 import mlx_tests
@@ -1012,6 +1015,337 @@ class TestBlas(mlx_tests.MLXTestCase):
         self.assertEqual(out[-1, -1].item(), 64.0)
         out = mx.addmm(c, a, b, 1.0, 2.0)
         self.assertEqual(out[-1, -1].item(), 66.0)
+
+    MIXED_FLOAT_PAIRS = (
+        (mx.float32, mx.bfloat16),
+        (mx.bfloat16, mx.float32),
+        (mx.float32, mx.float16),
+        (mx.float16, mx.float32),
+        (mx.bfloat16, mx.float16),
+        (mx.float16, mx.bfloat16),
+    )
+
+    def __mixed_inputs(self, shape_a, shape_b, ta, tb):
+        K = shape_a[-1]
+        a = mx.array(np.random.normal(0.0, 1.0, shape_a).astype(np.float32))
+        b = mx.array(np.random.normal(0.0, K**-0.5, shape_b).astype(np.float32))
+        a, b = a.astype(ta), b.astype(tb)
+        return a, b, np.array(a.astype(mx.float32)), np.array(b.astype(mx.float32))
+
+    def _mixed_tol(self, ta, tb):
+        if (
+            mx.default_device() == mx.gpu
+            and os.environ.get("MLX_ENABLE_TF32", "1") != "0"
+            and (ta == mx.float32 or tb == mx.float32)
+        ):
+            return 1e-2
+        return 1e-4
+
+    def test_mixed_float_matmul(self):
+        # Different float types give a float32 product without pre-casting inputs.
+        np.random.seed(0)
+        shapes = [(1, 32, 64), (2, 33, 65), (4, 64, 128), (7, 33, 65), (8, 128, 32)]
+        shapes += [(16, 128, 32), (17, 768, 512), (32, 64, 64), (63, 63, 31)]
+        shapes += [(64, 1, 33), (129, 7, 17), (300, 200, 1000), (64, 64, 4160)]
+        shapes += [(1100, 72, 96), (24, 1100, 96)]
+        for tf32 in (0, 1):
+            for ta, tb in self.MIXED_FLOAT_PAIRS:
+                both = ta != mx.float32 and tb != mx.float32
+                layouts = [
+                    (False, False),
+                    (False, True),
+                    (True, False),
+                    (True, True),
+                ]
+                for (M, N, K), (trans_a, trans_b) in itertools.product(shapes, layouts):
+                    with self.subTest(
+                        tf32=tf32, ta=ta, tb=tb, shape=(M, N, K), t=(trans_a, trans_b)
+                    ):
+                        a, b, a_np, b_np = self.__mixed_inputs(
+                            (K, M) if trans_a else (M, K),
+                            (N, K) if trans_b else (K, N),
+                            ta,
+                            tb,
+                        )
+                        if trans_a:
+                            a, a_np = a.T, a_np.T
+                        if trans_b:
+                            b, b_np = b.T, b_np.T
+                        with mx.config.scoped_update(MLX_ENABLE_TF32=tf32):
+                            out = a @ b
+                            mx.eval(out)
+                        self.assertEqual(out.dtype, mx.float32)
+                        self.assertEqual(out.shape, (M, N))
+                        # TF32 GEMM (M, N > 1) keeps 10 mantissa bits of float32
+                        tol = 1e-2 if tf32 and not both and min(M, N) > 1 else 1e-4
+                        self.assertTrue(np.allclose(out, a_np @ b_np, tol, tol))
+
+    def test_mixed_float_matmul_shapes(self):
+        np.random.seed(1)
+        for ta, tb in self.MIXED_FLOAT_PAIRS:
+            tol = self._mixed_tol(ta, tb)
+            with self.subTest(ta=ta, tb=tb):
+                # batched with broadcasting, and a batch folded into M
+                for sa, sb in (
+                    ((2, 1, 17, 45), (1, 3, 45, 70)),
+                    ((4, 3, 19, 64), (64, 65)),
+                ):
+                    a, b, a_np, b_np = self.__mixed_inputs(sa, sb, ta, tb)
+                    out = a @ b
+                    self.assertEqual(out.dtype, mx.float32)
+                    self.assertTrue(np.allclose(out, a_np @ b_np, tol, tol))
+
+                # strided slices and a stride-0 broadcast
+                a, b, a_np, b_np = self.__mixed_inputs((80, 128), (128, 96), ta, tb)
+                out = a[3:70:2, 5:100:2] @ b[7:102:2, 1:90:3]
+                ref = a_np[3:70:2, 5:100:2] @ b_np[7:102:2, 1:90:3]
+                self.assertTrue(np.allclose(out, ref, tol, tol))
+                a_b = mx.broadcast_to(a[:1, :64], (32, 64))
+                out = a_b @ b[:64]
+                ref = np.broadcast_to(a_np[:1, :64], (32, 64)) @ b_np[:64]
+                self.assertTrue(np.allclose(out, ref, tol, tol))
+
+                # vectors and 1x1
+                a, b, a_np, b_np = self.__mixed_inputs((97,), (97, 73), ta, tb)
+                self.assertTrue(np.allclose(a @ b, a_np @ b_np, tol, tol))
+                a, b, a_np, b_np = self.__mixed_inputs((37, 97), (97,), ta, tb)
+                self.assertTrue(np.allclose(a @ b, a_np @ b_np, tol, tol))
+                a, b, a_np, b_np = self.__mixed_inputs((1, 128), (128, 1), ta, tb)
+                out = a @ b
+                self.assertEqual(out.dtype, mx.float32)
+                self.assertTrue(np.allclose(out, a_np @ b_np, tol, tol))
+                a, b, a_np, b_np = self.__mixed_inputs((128,), (128,), ta, tb)
+                out = a @ b
+                self.assertEqual(out.dtype, mx.float32)
+                self.assertTrue(np.allclose(out, a_np @ b_np, tol, tol))
+
+                # empty shapes
+                for sa, sb in (
+                    ((0, 32), (32, 16)),
+                    ((16, 0), (0, 32)),
+                    ((16, 32), (32, 0)),
+                ):
+                    a = mx.zeros(sa, dtype=ta)
+                    b = mx.zeros(sb, dtype=tb)
+                    out = a @ b
+                    self.assertEqual(out.dtype, mx.float32)
+                    self.assertEqual(out.shape, (sa[0], sb[1]))
+                    self.assertEqual(
+                        out.size, 0 if sa[0] == 0 or sb[1] == 0 else out.size
+                    )
+                    if out.size > 0:
+                        self.assertTrue(mx.all(out == 0))
+
+    def test_mixed_float_matmul_addmm(self):
+        np.random.seed(2)
+        M, N, K = 33, 65, 48
+        for ta, tb in self.MIXED_FLOAT_PAIRS:
+            tol = self._mixed_tol(ta, tb)
+            a, b, a_np, b_np = self.__mixed_inputs((M, K), (N, K), ta, tb)
+            b, b_np = b.T, b_np.T
+            for c_shape in ((M, N), (N,), (1, N), (M, 1)):
+                for c_dtype in (mx.float32, mx.bfloat16):
+                    c = mx.array(np.random.normal(0.0, 1.0, c_shape)).astype(c_dtype)
+                    c_np = np.array(c.astype(mx.float32))
+                    for alpha, beta in ((1.0, 1.0), (0.5, 2.0), (1.0, 0.0), (2.0, 0.5)):
+                        with self.subTest(
+                            ta=ta, tb=tb, c=(c_shape, c_dtype), alpha=alpha, beta=beta
+                        ):
+                            out = mx.addmm(c, a, b, alpha=alpha, beta=beta)
+                            ref = alpha * (a_np @ b_np) + beta * c_np
+                            ref_same = mx.addmm(
+                                c,
+                                a.astype(mx.float32),
+                                b.astype(mx.float32),
+                                alpha=alpha,
+                                beta=beta,
+                            )
+                            self.assertEqual(out.dtype, mx.float32)
+                            self.assertTrue(np.allclose(out, ref, tol, tol))
+                            self.assertTrue(
+                                np.allclose(out, np.array(ref_same), 1e-3, 1e-3)
+                            )
+
+        # Large K: NAX split-K with the axpby accumulation
+        M, N, K = 64, 64, 300
+        for ta, tb in self.MIXED_FLOAT_PAIRS:
+            tol = self._mixed_tol(ta, tb)
+            a, b, a_np, b_np = self.__mixed_inputs((M, K), (K, N), ta, tb)
+            for c_shape in ((M, N), (N,)):
+                c = mx.array(np.random.normal(0.0, 1.0, c_shape)).astype(mx.float32)
+                c_np = np.array(c)
+                for alpha, beta in ((1.0, 1.0), (0.5, 2.0)):
+                    with self.subTest(ta=ta, tb=tb, c=c_shape, alpha=alpha, beta=beta):
+                        out = mx.addmm(c, a, b, alpha=alpha, beta=beta)
+                        ref = alpha * (a_np @ b_np) + beta * c_np
+                        self.assertEqual(out.dtype, mx.float32)
+                        self.assertTrue(np.allclose(out, ref, tol, tol))
+
+        # gemv_wide: M in {2, 4, 8}, K=64 and K=63, sliced offset
+        for ta, tb in self.MIXED_FLOAT_PAIRS:
+            tol = self._mixed_tol(ta, tb)
+            for M in (2, 4, 8):
+                for K_w in (64, 63):
+                    a, b, a_np, b_np = self.__mixed_inputs((M, K_w), (64, K_w), ta, tb)
+                    c_1d = mx.array(np.random.normal(0.0, 1.0, (64,))).astype(
+                        mx.float32
+                    )
+                    c_2d = mx.array(np.random.normal(0.0, 1.0, (M, 64))).astype(
+                        mx.float32
+                    )
+                    with self.subTest(wide=True, ta=ta, tb=tb, M=M, K=K_w):
+                        out = a @ b.T
+                        self.assertEqual(out.dtype, mx.float32)
+                        self.assertTrue(np.allclose(out, a_np @ b_np.T, tol, tol))
+                        for c_w in (c_1d, c_2d):
+                            out_a = mx.addmm(c_w, a, b.T, alpha=0.5, beta=2.0)
+                            ref_a = 0.5 * (a_np @ b_np.T) + 2.0 * np.array(c_w)
+                            self.assertTrue(np.allclose(out_a, ref_a, tol, tol))
+            a_big, b_big, a_big_np, b_big_np = self.__mixed_inputs(
+                (4, 72), (32, 72), ta, tb
+            )
+            c_off = mx.array(np.random.normal(0.0, 1.0, (4, 32))).astype(mx.float32)
+            a_sl = a_big[:, 1:65]
+            b_sl = b_big[:, 2:66].T
+            ref_sl = a_big_np[:, 1:65] @ b_big_np[:, 2:66].T
+            self.assertTrue(np.allclose(a_sl @ b_sl, ref_sl, tol, tol))
+            out_sl = mx.addmm(c_off, a_sl, b_sl, alpha=0.5, beta=2.0)
+            self.assertTrue(
+                np.allclose(out_sl, 0.5 * ref_sl + 2.0 * np.array(c_off), tol, tol)
+            )
+
+        # N == 1 and 1x1 addmm with c shapes and strides (bias_stride)
+        for ta, tb in (
+            (mx.float32, mx.float32),
+            (mx.bfloat16, mx.bfloat16),
+        ) + self.MIXED_FLOAT_PAIRS:
+            tc = ta if ta == tb else mx.float32
+            a, b, a_np, b_np = self.__mixed_inputs((25, 64), (64, 1), ta, tb)
+            c_base = mx.array(np.random.normal(0.0, 1.0, (50, 2))).astype(tc)
+            for c in (
+                mx.array(np.random.normal(0.0, 1.0, (25, 1))).astype(tc),
+                mx.array(np.random.normal(0.0, 1.0, (1, 1))).astype(tc),
+                c_base[::2, :1],
+            ):
+                c_np = np.array(c.astype(mx.float32))
+                out = mx.addmm(c, a, b, alpha=0.5, beta=2.0)
+                ref = 0.5 * (a_np @ b_np) + 2.0 * c_np
+                self.assertEqual(out.dtype, tc)
+                tol = 1e-2 if tc == mx.bfloat16 else 1e-4
+                self.assertTrue(np.allclose(out.astype(mx.float32), ref, tol, tol))
+
+        a, b, a_np, b_np = self.__mixed_inputs(
+            (1, 64), (64, 1), mx.float32, mx.bfloat16
+        )
+        c = mx.array([[1.25]], dtype=mx.float32)
+        out = mx.addmm(c, a, b, alpha=0.5, beta=2.0)
+        self.assertEqual(out.dtype, mx.float32)
+        self.assertTrue(
+            np.allclose(out, 0.5 * (a_np @ b_np) + 2.0 * np.array(c), 1e-4, 1e-4)
+        )
+
+    def test_mixed_float_matmul_grad(self):
+        np.random.seed(3)
+        f32 = mx.float32
+        for ta, tb in self.MIXED_FLOAT_PAIRS:
+            tol = self._mixed_tol(ta, tb)
+            with self.subTest(ta=ta, tb=tb):
+                a, b, _, _ = self.__mixed_inputs((17, 48), (48, 65), ta, tb)
+                c = mx.array(np.random.normal(0.0, 1.0, (65,))).astype(mx.bfloat16)
+                fns = [
+                    (lambda x, y: x @ y, lambda x, y: x.astype(f32) @ y.astype(f32)),
+                    (
+                        lambda x, y: mx.addmm(c, x, y, 0.5, 1.5),
+                        lambda x, y: mx.addmm(
+                            c, x.astype(f32), y.astype(f32), 0.5, 1.5
+                        ),
+                    ),
+                ]
+                for fn, ref_fn in fns:
+                    cotan = mx.ones((17, 65))
+                    (out,), grads = mx.vjp(fn, [a, b], [cotan])
+                    (ref,), ref_grads = mx.vjp(ref_fn, [a, b], [cotan])
+                    self.assertTrue(mx.allclose(out, ref, tol, tol))
+                    for g, r, p in zip(grads, ref_grads, (a, b)):
+                        self.assertEqual(g.dtype, p.dtype)
+                        self.assertTrue(
+                            mx.allclose(g.astype(f32), r.astype(f32), 1e-2, 1e-2)
+                        )
+                    tangents = [mx.ones_like(a), mx.ones_like(b)]
+                    _, (jvp,) = mx.jvp(fn, [a, b], tangents)
+                    _, (ref_jvp,) = mx.jvp(ref_fn, [a, b], tangents)
+                    self.assertTrue(mx.allclose(jvp, ref_jvp, tol, tol))
+
+                a, b, a_np, b_np = self.__mixed_inputs((4, 17, 48), (4, 48, 65), ta, tb)
+                out = mx.vmap(lambda x, y: x @ y)(a, b)
+                self.assertTrue(np.allclose(out, a_np @ b_np, tol, tol))
+                out = mx.compile(lambda x, y: x @ y)(a, b)
+                self.assertTrue(np.allclose(out, a_np @ b_np, tol, tol))
+
+    def test_mixed_float_matmul_export_cpu_replay(self):
+        np.random.seed(4)
+        has_nax = False
+        if mx.default_device() == mx.gpu and mx.metal.is_available():
+            arch = mx.device_info()["architecture"]
+            gen = int(
+                "".join(ch for ch in arch.rsplit("_g", 1)[-1] if ch.isdigit()) or 0
+            )
+            has_nax = gen >= (18 if arch.endswith("p") else 17)
+
+        for ta, tb in ((mx.float32, mx.bfloat16), (mx.bfloat16, mx.float16)):
+            tol = self._mixed_tol(ta, tb)
+            a, b, a_np, b_np = self.__mixed_inputs((8, 32), (32, 16), ta, tb)
+            c = mx.array(np.random.normal(0.0, 1.0, (16,))).astype(mx.float32)
+            c_np = np.array(c)
+
+            def fn(x, y, z):
+                return mx.addmm(z, x, y, 0.5, 2.0) + (x @ y)
+
+            def fn_ref(x, y, z):
+                x, y = x.astype(mx.float32), y.astype(mx.float32)
+                return mx.addmm(z, x, y, 0.5, 2.0) + (x @ y)
+
+            if has_nax:
+                events = []
+                mx.export_function(events.append, fn, a, b, c)
+                prims = [e["name"] for e in events if e.get("type") == "primitive"]
+                self.assertIn("AddMM", prims)
+                self.assertIn("Matmul", prims)
+                self.assertNotIn("AsType", prims)
+
+            with tempfile.TemporaryDirectory() as d:
+                path_def = f"{d}/fn_def.mlxfn"
+                mx.export_function(path_def, fn, a, b, c)
+                (out,) = mx.import_function(path_def)(a, b, c)
+                mx.eval(out)
+                self.assertEqual(out.dtype, mx.float32)
+                self.assertTrue(np.allclose(out, fn_ref(a, b, c), tol, tol))
+
+                path_cpu = f"{d}/fn_cpu.mlxfn"
+                with mx.stream(mx.cpu):
+                    mx.export_function(path_cpu, fn, a, b, c)
+                    (out_cpu,) = mx.import_function(path_cpu)(a, b, c)
+                    mx.eval(out_cpu)
+                self.assertEqual(out_cpu.dtype, mx.float32)
+                ref = 1.5 * (a_np @ b_np) + 2.0 * c_np
+                self.assertTrue(np.allclose(out_cpu, ref, 1e-4, 1e-4))
+
+    def test_mixed_float_matmul_memory(self):
+        if mx.default_device() == mx.cpu or not mx.metal.is_available():
+            self.skipTest("requires Metal")
+        arch = mx.device_info()["architecture"]
+        gen = int("".join(ch for ch in arch.rsplit("_g", 1)[-1] if ch.isdigit()) or 0)
+        if gen < (18 if arch.endswith("p") else 17):
+            self.skipTest("requires a GPU with tensor ops")
+        x = mx.random.normal((8, 4096))
+        w = mx.random.normal((4096, 4096)).astype(mx.bfloat16)
+        mx.eval(x, w)
+        mx.synchronize()
+        mx.reset_peak_memory()
+        base = mx.get_active_memory()
+        mx.eval(x @ w.T)
+        extra = mx.get_peak_memory() - base
+        self.assertLess(extra, w.size * 4 // 2)
 
     def test_addmm_grad(self):
         def make_ref_addmm(alpha, beta):

@@ -23,6 +23,25 @@ namespace mlx::core {
 
 namespace {
 
+bool can_mixed_float_matmul(
+    Dtype a,
+    Dtype b,
+    Dtype out_type,
+    StreamOrDevice s) {
+  if (a == b || out_type != float32) {
+    return false;
+  }
+  auto is_supported = [](Dtype d) {
+    return d == float32 || d == bfloat16 || d == float16;
+  };
+  if (!is_supported(a) || !is_supported(b)) {
+    return false;
+  }
+  auto stream = to_stream(s);
+  return stream.device == Device::gpu && metal::is_available() &&
+      metal::is_nax_available();
+}
+
 // Pass the reduction's name in `op_without_identity` when it has no identity
 // element, as max and min do not. Those are undefined over an empty axis, so
 // naming them here has that checked. Reductions with an identity, such as sum
@@ -3685,11 +3704,13 @@ array matmul(
         << " in " << out_type << ", which is not a floating point type.";
     throw std::invalid_argument(msg.str());
   }
-  if (a.dtype() != out_type) {
-    a = astype(a, out_type, s);
-  }
-  if (b.dtype() != out_type) {
-    b = astype(b, out_type, s);
+  if (!can_mixed_float_matmul(a.dtype(), b.dtype(), out_type, s)) {
+    if (a.dtype() != out_type) {
+      a = astype(a, out_type, s);
+    }
+    if (b.dtype() != out_type) {
+      b = astype(b, out_type, s);
+    }
   }
 
   // We can batch the multiplication by reshaping a
@@ -6093,8 +6114,10 @@ array addmm(
     throw std::invalid_argument(msg.str());
   }
 
-  a = astype(a, out_type, s);
-  b = astype(b, out_type, s);
+  if (!can_mixed_float_matmul(a.dtype(), b.dtype(), out_type, s)) {
+    a = astype(a, out_type, s);
+    b = astype(b, out_type, s);
+  }
   c = astype(c, out_type, s);
 
   // We can batch the multiplication by reshaping a

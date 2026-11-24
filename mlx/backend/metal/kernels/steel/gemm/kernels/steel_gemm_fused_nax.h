@@ -82,12 +82,15 @@ template <
     int WN,
     bool transpose_a,
     bool transpose_b,
-    typename AccumType = float>
+    typename AccumType = float,
+    typename TB = T,
+    typename OutT = T,
+    bool kRelaxed = true>
 [[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void gemm(
     const device T* A [[buffer(0)]],
-    const device T* B [[buffer(1)]],
-    const device T* C [[buffer(2), function_constant(use_out_source)]],
-    device T* D [[buffer(3)]],
+    const device TB* B [[buffer(1)]],
+    const device OutT* C [[buffer(2), function_constant(use_out_source)]],
+    device OutT* D [[buffer(3)]],
     const constant GEMMParams* params [[buffer(4)]],
     const constant GEMMAddMMParams* addmm_params [[buffer(5), function_constant(use_out_source)]],
     const constant int* batch_shape [[buffer(6), function_constant(has_batch)]],
@@ -191,7 +194,9 @@ template <
             kAlignedM.value,
             kAlignedN.value,
             kAlignedK.value,
-            AccumType>(
+            AccumType,
+            TB,
+            kRelaxed>(
             A,
             B,
             params->lda,

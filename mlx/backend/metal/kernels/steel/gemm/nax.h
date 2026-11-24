@@ -389,7 +389,8 @@ struct BaseNAXFrag {
       typename AType,
       typename BType,
       bool transpose_a = false,
-      bool transpose_b = false>
+      bool transpose_b = false,
+      bool kRelaxed = true>
   METAL_FUNC static constexpr void mma(
       thread dtype_frag_t<CType>& Cn0,
       thread dtype_frag_t<CType>& Cn1,
@@ -404,7 +405,7 @@ struct BaseNAXFrag {
         16,
         transpose_a,
         transpose_b,
-        true,
+        kRelaxed,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
 
     // Create matmul op
@@ -460,7 +461,8 @@ struct BaseNAXFrag {
       typename AType,
       typename BType,
       bool transpose_a = false,
-      bool transpose_b = false>
+      bool transpose_b = false,
+      bool kRelaxed = true>
   METAL_FUNC static constexpr void mma(
       thread dtype_frag_t<CType>& Cm0,
       thread dtype_frag_t<CType>& Cm1,
@@ -476,7 +478,7 @@ struct BaseNAXFrag {
         16,
         transpose_a,
         transpose_b,
-        true,
+        kRelaxed,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
 
     // Create matmul op
@@ -832,13 +834,15 @@ template <
     class ATile,
     class BTile,
     bool transpose_a,
-    bool transpose_b>
+    bool transpose_b,
+    bool kRelaxed = true>
 METAL_FUNC void tile_matmad_nax(
     thread CTile& C,
     thread ATile& A,
     metal::bool_constant<transpose_a>,
     thread BTile& B,
-    metal::bool_constant<transpose_b>) {
+    metal::bool_constant<transpose_b>,
+    metal::bool_constant<kRelaxed> = {}) {
   // Static checks
   constexpr short TMa = transpose_a ? ATile::kTileCols : ATile::kTileRows;
   constexpr short TM = CTile::kTileRows;
@@ -862,7 +866,13 @@ METAL_FUNC void tile_matmad_nax(
       for (short nn = 0; nn < TN; ++nn) {
         STEEL_PRAGMA_UNROLL
         for (short kk = 0; kk < TK; ++kk) {
-          CTile::NAXFrag_t::mma(
+          CTile::NAXFrag_t::template mma<
+              typename CTile::elem_type,
+              typename ATile::elem_type,
+              typename BTile::elem_type,
+              transpose_a,
+              transpose_b,
+              kRelaxed>(
               C.frag_at(mm, nn),
               C.frag_at(mm + 1, nn),
               A.frag_at(mm, kk, ta),
@@ -880,7 +890,13 @@ METAL_FUNC void tile_matmad_nax(
       for (short nn = 0; nn < TN; nn += 2) {
         STEEL_PRAGMA_UNROLL
         for (short kk = 0; kk < TK; ++kk) {
-          CTile::NAXFrag_t::mma(
+          CTile::NAXFrag_t::template mma<
+              typename CTile::elem_type,
+              typename ATile::elem_type,
+              typename BTile::elem_type,
+              transpose_a,
+              transpose_b,
+              kRelaxed>(
               C.frag_at(mm, nn),
               C.frag_at(mm, nn + 1),
               A.frag_at(mm, kk, ta),

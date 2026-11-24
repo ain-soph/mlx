@@ -35,7 +35,9 @@ template <
     const int TM, /* Thread rows (in elements) */
     const int TN, /* Thread cols (in elements) */
     const bool kDoAxpby, /* Do out = alpha * out + beta * bias */
-    typename AccT = typename DefaultAccT<T>::type>
+    typename AccT = typename DefaultAccT<T>::type,
+    typename MatT = T,
+    typename VecT = T>
 struct GEMVKernel {
   using acc_type = AccT;
 
@@ -74,18 +76,20 @@ struct GEMVKernel {
   MLX_MTL_CONST short tgp_mem_size = BN > 1 ? BN*(blockM + TM) : 0;
   MLX_MTL_CONST bool needs_tgp_reduction = BN > 1;
 
-  template <typename U = T>
-  static METAL_FUNC void
-  load_unsafe(const device T* src, thread U dst[TN], const int src_offset = 0) {
+  template <typename U = MatT, typename SrcT = MatT>
+  static METAL_FUNC void load_unsafe(
+      const device SrcT* src,
+      thread U dst[TN],
+      const int src_offset = 0) {
     MLX_MTL_PRAGMA_UNROLL
     for (int tn = 0; tn < TN; tn++) {
       dst[tn] = static_cast<U>(src[src_offset + tn]);
     }
   }
 
-  template <typename U = T>
+  template <typename U = MatT, typename SrcT = MatT>
   static METAL_FUNC void load_safe(
-      const device T* src,
+      const device SrcT* src,
       thread U dst[TN],
       const int src_offset = 0,
       const int src_size = TN) {
@@ -105,8 +109,8 @@ struct GEMVKernel {
   }
 
   static METAL_FUNC void run(
-      const device T* mat [[buffer(0)]],
-      const device T* in_vec [[buffer(1)]],
+      const device MatT* mat [[buffer(0)]],
+      const device VecT* in_vec [[buffer(1)]],
       const device T* bias [[buffer(2)]],
       device T* out_vec [[buffer(3)]],
       const constant int& in_vec_size [[buffer(4)]],
@@ -125,7 +129,7 @@ struct GEMVKernel {
 
     // Thread local accumulation results
     thread AccT result[TM] = {0};
-    thread T inter[TN];
+    thread MatT inter[TN];
     thread AccT v_coeff[TN];
 
     const int thrM = SN != 32 ? simd_lid / SN : 0;
@@ -260,7 +264,9 @@ template <
     const int TM, /* Thread rows (in elements) */
     const int TN, /* Thread cols (in elements) */
     const bool kDoAxpby, /* Do out = alpha * out + beta * bias */
-    typename AccT = typename DefaultAccT<T>::type>
+    typename AccT = typename DefaultAccT<T>::type,
+    typename MatT = T,
+    typename VecT = T>
 struct GEMVTKernel {
   using acc_type = AccT;
 
@@ -295,8 +301,8 @@ struct GEMVTKernel {
   MLX_MTL_CONST bool needs_tgp_reduction = BM > 1;
 
   static METAL_FUNC void run(
-      const device T* mat [[buffer(0)]],
-      const device T* in_vec [[buffer(1)]],
+      const device MatT* mat [[buffer(0)]],
+      const device VecT* in_vec [[buffer(1)]],
       const device T* bias [[buffer(2)]],
       device T* out_vec [[buffer(3)]],
       const constant int& in_vec_size [[buffer(4)]],
@@ -315,7 +321,7 @@ struct GEMVTKernel {
 
     // Thread local accumulation results
     AccT result[TN] = {0};
-    T inter[TN];
+    MatT inter[TN];
     AccT v_coeff[TM];
     const int thrM = SN != 32 ? simd_lid / SN : 0;
     const int thrN = SN != 32 ? simd_lid % SN : int(simd_lid);
@@ -448,10 +454,12 @@ template <
     const int TM, /* Thread rows (in elements) */
     const int TN, /* Thread cols (in elements) */
     const bool kDoNCBatch, /* Batch ndim > 1 */
-    const bool kDoAxpby> /* Do out = alpha * out + beta * bias */
+    const bool kDoAxpby, /* Do out = alpha * out + beta * bias */
+    typename MatT = T,
+    typename VecT = T>
 [[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]] void gemv(
-    const device T* mat [[buffer(0)]],
-    const device T* in_vec [[buffer(1)]],
+    const device MatT* mat [[buffer(0)]],
+    const device VecT* in_vec [[buffer(1)]],
     const device T* bias [[buffer(2)]],
     device T* out_vec [[buffer(3)]],
     const constant int& in_vec_size [[buffer(4)]],
@@ -469,7 +477,18 @@ template <
     uint3 lid [[thread_position_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  using gemv_kernel = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
+  using gemv_kernel = GEMVKernel<
+      T,
+      BM,
+      BN,
+      SM,
+      SN,
+      TM,
+      TN,
+      kDoAxpby,
+      typename DefaultAccT<T>::type,
+      MatT,
+      VecT>;
   threadgroup typename gemv_kernel::acc_type tgp_memory
       [gemv_kernel::tgp_mem_size == 0 ? 1 : gemv_kernel::tgp_mem_size];
 
@@ -614,10 +633,12 @@ template <
     const int TM, /* Thread rows (in elements) */
     const int TN, /* Thread cols (in elements) */
     const bool kDoNCBatch, /* Batch ndim > 1 */
-    const bool kDoAxpby> /* Do out = alpha * out + beta * bias */
+    const bool kDoAxpby, /* Do out = alpha * out + beta * bias */
+    typename MatT = T,
+    typename VecT = T>
 [[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]] void gemv_t(
-    const device T* mat [[buffer(0)]],
-    const device T* in_vec [[buffer(1)]],
+    const device MatT* mat [[buffer(0)]],
+    const device VecT* in_vec [[buffer(1)]],
     const device T* bias [[buffer(2)]],
     device T* out_vec [[buffer(3)]],
     const constant int& in_vec_size [[buffer(4)]],
@@ -635,7 +656,18 @@ template <
     uint3 lid [[thread_position_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  using gemv_kernel = GEMVTKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
+  using gemv_kernel = GEMVTKernel<
+      T,
+      BM,
+      BN,
+      SM,
+      SN,
+      TM,
+      TN,
+      kDoAxpby,
+      typename DefaultAccT<T>::type,
+      MatT,
+      VecT>;
   threadgroup typename gemv_kernel::acc_type tgp_memory
       [gemv_kernel::tgp_mem_size == 0 ? 1 : gemv_kernel::tgp_mem_size];
 
@@ -783,14 +815,16 @@ template <
     typename T,
     const int vecs_per_tg,
     const int k_lanes,
-    typename AccT = typename DefaultAccT<T>::type>
+    typename AccT = typename DefaultAccT<T>::type,
+    typename MatT = T,
+    typename VecT = T>
 struct GemvWide {
   static constexpr constant int unroll = 8;
   static constexpr constant int num_simdgroups = k_lanes / 8;
 
   static METAL_FUNC void run(
-      const device T* mat,
-      const device T* in_vec,
+      const device MatT* mat,
+      const device VecT* in_vec,
       const device T* bias,
       device T* out_vec,
       int in_vec_size,
@@ -820,15 +854,15 @@ struct GemvWide {
     // Clamped tail rows/vectors read valid memory; the guarded writes
     // below never store them.
     const int row = min(out_row, out_vec_size - 1);
-    const device T* wrow = mat + int64_t(row) * matrix_ld;
-    const device vec<T, 4>* w4 = (const device vec<T, 4>*)wrow;
+    const device MatT* wrow = mat + int64_t(row) * matrix_ld;
+    const device vec<MatT, 4>* w4 = (const device vec<MatT, 4>*)wrow;
     const int n_v4 = in_vec_size / 4;
     const int n_main = n_v4 - n_v4 % (k_lanes * unroll);
 
     // Vector chunks beyond grid.x round-robin onto the same threadgroups:
     // re-walking the row block hits cache where an extra grid column would
     // re-stream it from DRAM.
-    const device vec<T, 4>* x4 = (const device vec<T, 4>*)in_vec;
+    const device vec<VecT, 4>* x4 = (const device vec<VecT, 4>*)in_vec;
     const int x_ld4 = vector_ld / 4;
     const int n_chunks = (M + vecs_per_tg - 1) / vecs_per_tg;
     for (int chunk = tid.x; chunk < n_chunks; chunk += tgpg.x) {
@@ -898,10 +932,15 @@ struct GemvWide {
   }
 };
 
-template <typename T, const int vecs_per_tg, const int k_lanes>
+template <
+    typename T,
+    const int vecs_per_tg,
+    const int k_lanes,
+    typename MatT = T,
+    typename VecT = T>
 [[kernel]] void gemv_wide(
-    const device T* mat [[buffer(0)]],
-    const device T* in_vec [[buffer(1)]],
+    const device MatT* mat [[buffer(0)]],
+    const device VecT* in_vec [[buffer(1)]],
     const device T* bias [[buffer(2), function_constant(gemv_wide_do_axpby)]],
     device T* out_vec [[buffer(3)]],
     const constant int& in_vec_size [[buffer(4)]],
@@ -944,24 +983,24 @@ template <typename T, const int vecs_per_tg, const int k_lanes>
   }
   out_vec += int64_t(tid.z) * M * out_vec_size;
 
-  GemvWide<T, vecs_per_tg, k_lanes>::run(
-      mat,
-      in_vec,
-      bias,
-      out_vec,
-      in_vec_size,
-      out_vec_size,
-      M,
-      matrix_ld,
-      vector_ld,
-      alpha,
-      beta,
-      bias_ld,
-      bias_fd,
-      tid,
-      tgpg,
-      simd_gid,
-      simd_lid);
+  GemvWide<T, vecs_per_tg, k_lanes, typename DefaultAccT<T>::type, MatT, VecT>::
+      run(mat,
+          in_vec,
+          bias,
+          out_vec,
+          in_vec_size,
+          out_vec_size,
+          M,
+          matrix_ld,
+          vector_ld,
+          alpha,
+          beta,
+          bias_ld,
+          bias_fd,
+          tid,
+          tgpg,
+          simd_gid,
+          simd_lid);
 }
 
 template <typename T, const int vecs_per_tg, const int k_lanes>

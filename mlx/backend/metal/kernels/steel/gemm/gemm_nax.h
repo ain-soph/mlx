@@ -22,10 +22,12 @@ template <
     bool kAlignedM,
     bool kAlignedN,
     bool kAlignedK,
-    typename AccumType = float>
+    typename AccumType = float,
+    typename TB = T,
+    bool kRelaxed = true>
 auto gemm_loop(
     const device T* A,
-    const device T* B,
+    const device TB* B,
     int lda,
     int ldb,
     int K,
@@ -60,7 +62,7 @@ auto gemm_loop(
     STEEL_PRAGMA_NO_UNROLL
     for (int kk1 = 0; kk1 < BK; kk1 += SK) {
       NAXTile<T, RA, CA> Atile;
-      NAXTile<T, RB, CB> Btile;
+      NAXTile<TB, RB, CB> Btile;
       const int k = kk1;
 
       volatile int compiler_barrier;
@@ -89,7 +91,8 @@ auto gemm_loop(
           Atile,
           metal::bool_constant<transpose_a>{},
           Btile,
-          metal::bool_constant<transpose_b>{});
+          metal::bool_constant<transpose_b>{},
+          metal::bool_constant<kRelaxed>{});
 
       (void)compiler_barrier;
     }
@@ -110,7 +113,7 @@ auto gemm_loop(
     STEEL_PRAGMA_NO_UNROLL
     for (int kk1 = 0; kk1 < rem_bk; kk1 += SK) {
       NAXTile<T, RA, CA> Atile;
-      NAXTile<T, RB, CB> Btile;
+      NAXTile<TB, RB, CB> Btile;
 
       const int k = kk1;
       const short psk = max(0, rem_bk - k);
@@ -131,7 +134,8 @@ auto gemm_loop(
           Atile,
           metal::bool_constant<transpose_a>{},
           Btile,
-          metal::bool_constant<transpose_b>{});
+          metal::bool_constant<transpose_b>{},
+          metal::bool_constant<kRelaxed>{});
     }
   }
 

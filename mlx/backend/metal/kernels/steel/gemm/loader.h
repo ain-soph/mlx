@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <metal_stdlib>
+
 #include "mlx/backend/metal/kernels/steel/defines.h"
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -21,7 +23,8 @@ template <
     short alignment = 1,
     short n_reads = (BCOLS * BROWS) / (tgp_size),
     short TCOLS = BCOLS / n_reads,
-    short TROWS = tgp_size / TCOLS>
+    short TROWS = tgp_size / TCOLS,
+    typename SrcT = T>
 struct BlockLoader {
   STEEL_CONST short n_rows = (BROWS + TROWS - 1) / TROWS;
   STEEL_CONST short vec_size = n_reads;
@@ -37,7 +40,7 @@ struct BlockLoader {
 
   // threadgroup and device memory
   threadgroup T* dst;
-  const device T* src;
+  const device SrcT* src;
 
   struct alignas(alignment * sizeof(T)) ReadVector {
     uint8_t v[sizeof(T) * vec_size];
@@ -45,7 +48,7 @@ struct BlockLoader {
 
   /* Constructor */
   METAL_FUNC BlockLoader(
-      const device T* src_,
+      const device SrcT* src_,
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -72,10 +75,20 @@ struct BlockLoader {
 
   /* Load from device memory into threadgroup memory - without bound checking */
   METAL_FUNC void load_unsafe() const thread {
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < BROWS; i += TROWS) {
-      *((threadgroup ReadVector*)(&dst[i * dst_ld])) =
-          *((const device ReadVector*)(&src[i * src_ld]));
+    if constexpr (metal::is_same_v<SrcT, T>) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < BROWS; i += TROWS) {
+        *((threadgroup ReadVector*)(&dst[i * dst_ld])) =
+            *((const device ReadVector*)(&src[i * src_ld]));
+      }
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < BROWS; i += TROWS) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < vec_size; j++) {
+          dst[i * dst_ld + j] = static_cast<T>(src[i * src_ld + j]);
+        }
+      }
     }
   }
 
@@ -110,7 +123,11 @@ struct BlockLoader {
       // Read valid indices into tmp_val
       STEEL_PRAGMA_UNROLL
       for (short j = 0; j < vec_size; j++) {
-        tmp_val[j] = src[(tmp_idx[j] ? i * src_ld + j : 0)];
+        if constexpr (metal::is_same_v<SrcT, T>) {
+          tmp_val[j] = src[(tmp_idx[j] ? i * src_ld + j : 0)];
+        } else {
+          tmp_val[j] = static_cast<T>(src[(tmp_idx[j] ? i * src_ld + j : 0)]);
+        }
       }
 
       // Zero out unneeded values

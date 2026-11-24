@@ -34,6 +34,23 @@ make_jit_source(indexing/gather_front kernels/indexing/indexing.h)
 make_jit_source(indexing/gather_axis)
 make_jit_source(indexing/scatter_axis)
 make_jit_source(hadamard)
+make_jit_source(gemv kernels/steel/utils.h)
+make_jit_source(
+  steel/gemm/gemm kernels/steel/utils.h kernels/steel/gemm/loader.h
+  kernels/steel/gemm/mma.h kernels/steel/gemm/params.h
+  kernels/steel/gemm/transforms.h)
+make_jit_source(steel/gemm/kernels/steel_gemm_fused)
+make_jit_source(steel/gemm/kernels/steel_gemm_splitk)
+
+if(MLX_METAL_VERSION GREATER_EQUAL 400
+   AND MACOS_SDK_VERSION VERSION_GREATER_EQUAL 26.2
+   AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_GREATER_EQUAL 26.2)
+  make_jit_source(
+    steel/gemm/gemm_nax kernels/steel/utils.h kernels/steel/gemm/nax.h
+    kernels/steel/gemm/params.h kernels/steel/gemm/transforms.h)
+  make_jit_source(steel/gemm/kernels/steel_gemm_fused_nax)
+  make_jit_source(steel/gemm/kernels/steel_gemm_splitk_nax)
+endif()
 
 if(MLX_METAL_JIT)
   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/jit_kernels.cpp)
@@ -53,14 +70,8 @@ if(MLX_METAL_JIT)
   make_jit_source(
     reduce kernels/reduction/reduce_all.h kernels/reduction/reduce_col.h
     kernels/reduction/reduce_row.h kernels/reduction/reduce_init.h)
-  make_jit_source(
-    steel/gemm/gemm kernels/steel/utils.h kernels/steel/gemm/loader.h
-    kernels/steel/gemm/mma.h kernels/steel/gemm/params.h
-    kernels/steel/gemm/transforms.h)
-  make_jit_source(steel/gemm/kernels/steel_gemm_fused)
   make_jit_source(steel/gemm/kernels/steel_gemm_masked kernels/steel/defines.h)
   make_jit_source(steel/gemm/kernels/steel_gemm_gather)
-  make_jit_source(steel/gemm/kernels/steel_gemm_splitk)
   make_jit_source(steel/gemm/kernels/steel_gemm_segmented)
   make_jit_source(
     steel/conv/conv
@@ -81,7 +92,6 @@ if(MLX_METAL_JIT)
   make_jit_source(quantized kernels/quantized_utils.h)
   make_jit_source(fp_quantized kernels/quantized_utils.h kernels/fp8.h
                   kernels/fp4.h)
-  make_jit_source(gemv)
   make_jit_source(gemv_masked)
 
   make_jit_source(steel/attn/kernels/steel_attention)
@@ -90,12 +100,7 @@ if(MLX_METAL_JIT)
      AND MACOS_SDK_VERSION VERSION_GREATER_EQUAL 26.2
      AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_GREATER_EQUAL 26.2)
 
-    make_jit_source(
-      steel/gemm/gemm_nax kernels/steel/utils.h kernels/steel/gemm/nax.h
-      kernels/steel/gemm/params.h kernels/steel/gemm/transforms.h)
-    make_jit_source(steel/gemm/kernels/steel_gemm_fused_nax)
     make_jit_source(steel/gemm/kernels/steel_gemm_gather_nax)
-    make_jit_source(steel/gemm/kernels/steel_gemm_splitk_nax)
     make_jit_source(steel/gemm/kernels/steel_gemm_segmented_nax)
     make_jit_source(steel/gemm/kernels/steel_gemm_thin_nax)
 

@@ -17,10 +17,12 @@ template <
     bool transpose_a,
     bool transpose_b,
     bool MN_aligned,
-    bool K_aligned>
+    bool K_aligned,
+    typename TA = T,
+    typename TB = T>
 [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void gemm_splitk(
-    const device T* A [[buffer(0)]],
-    const device T* B [[buffer(1)]],
+    const device TA* A [[buffer(0)]],
+    const device TB* B [[buffer(1)]],
     device U* C [[buffer(2)]],
     const constant GEMMSpiltKParams* params [[buffer(3)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
@@ -40,7 +42,11 @@ template <
       transpose_a,
       transpose_b,
       MN_aligned,
-      K_aligned>;
+      K_aligned,
+      typename AccumHelper<T>::accum_type,
+      TransformNone<U, typename AccumHelper<T>::accum_type>,
+      TA,
+      TB>;
   using loader_a_t = typename gemm_kernel::loader_a_t;
   using loader_b_t = typename gemm_kernel::loader_b_t;
   using mma_t = typename gemm_kernel::mma_t;

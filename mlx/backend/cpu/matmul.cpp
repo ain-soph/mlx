@@ -90,13 +90,25 @@ void matmul_general(
     }
   };
 
-  auto [a_transposed, lda, a] = check_transpose(a_pre);
-  auto [b_transposed, ldb, b] = check_transpose(b_pre);
-  size_t M = a.shape(-2);
-  size_t N = b.shape(-1);
+  auto promote = [stream, &temps, dtype = out.dtype()](const array& arr) {
+    if (arr.dtype() == dtype) {
+      return arr;
+    }
+    temps.push_back(array(arr.shape(), dtype, nullptr, {}));
+    CopyType ctype =
+        arr.flags().row_contiguous ? CopyType::Vector : CopyType::General;
+    copy_cpu(arr, temps.back(), ctype, stream);
+    return temps.back();
+  };
+
+  size_t M = a_pre.shape(-2);
+  size_t N = b_pre.shape(-1);
   if (M == 0 || N == 0) {
     return;
   }
+
+  auto [a_transposed, lda, a] = check_transpose(promote(a_pre));
+  auto [b_transposed, ldb, b] = check_transpose(promote(b_pre));
 
   dispatch_inexact_types(out.dtype(), "[Matmul::eval_cpu]", [&](auto type_tag) {
     using T = MLX_GET_TYPE(type_tag);

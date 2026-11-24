@@ -25,10 +25,12 @@ template <
     int WN,
     bool transpose_a,
     bool transpose_b,
-    typename AccumType = float>
+    typename AccumType = float,
+    typename TA = T,
+    typename TB = T>
 [[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void gemm(
-    const device T* A [[buffer(0)]],
-    const device T* B [[buffer(1)]],
+    const device TA* A [[buffer(0)]],
+    const device TB* B [[buffer(1)]],
     const device T* C [[buffer(2), function_constant(use_out_source)]],
     device T* D [[buffer(3)]],
     const constant GEMMParams* params [[buffer(4)]],
@@ -54,7 +56,10 @@ template <
       transpose_b,
       true,
       true,
-      AccumType>;
+      AccumType,
+      TransformNone<T, AccumType>,
+      TA,
+      TB>;
 
   using loader_a_t = typename gemm_kernel::loader_a_t;
   using loader_b_t = typename gemm_kernel::loader_b_t;

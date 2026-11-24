@@ -33,7 +33,9 @@ template <
     bool MN_aligned,
     bool K_aligned,
     typename AccumType = typename AccumHelper<T>::accum_type,
-    typename Epilogue = TransformNone<U, AccumType>>
+    typename Epilogue = TransformNone<U, AccumType>,
+    typename TA = T,
+    typename TB = T>
 struct GEMMKernel {
   STEEL_CONST short tgp_padding_a = 16 / sizeof(T);
   STEEL_CONST short tgp_padding_b = 16 / sizeof(T);
@@ -45,20 +47,40 @@ struct GEMMKernel {
 
   STEEL_CONST short tgp_size = WM * WN * 32;
 
+  STEEL_CONST short a_rows = transpose_a ? BK : BM;
+  STEEL_CONST short a_cols = transpose_a ? BM : BK;
+  STEEL_CONST short a_n_reads = (a_cols * a_rows) / tgp_size;
+  STEEL_CONST short a_tcols = a_cols / a_n_reads;
+
+  STEEL_CONST short b_rows = transpose_b ? BN : BK;
+  STEEL_CONST short b_cols = transpose_b ? BK : BN;
+  STEEL_CONST short b_n_reads = (b_cols * b_rows) / tgp_size;
+  STEEL_CONST short b_tcols = b_cols / b_n_reads;
+
   using loader_a_t = BlockLoader<
       T,
-      transpose_a ? BK : BM,
-      transpose_a ? BM : BK,
+      a_rows,
+      a_cols,
       transpose_a ? BM + tgp_padding_a : BK + tgp_padding_a,
       !transpose_a,
-      tgp_size>;
+      tgp_size,
+      1,
+      a_n_reads,
+      a_tcols,
+      tgp_size / a_tcols,
+      TA>;
   using loader_b_t = BlockLoader<
       T,
-      transpose_b ? BN : BK,
-      transpose_b ? BK : BN,
+      b_rows,
+      b_cols,
       transpose_b ? BK + tgp_padding_b : BN + tgp_padding_b,
       transpose_b,
-      tgp_size>;
+      tgp_size,
+      1,
+      b_n_reads,
+      b_tcols,
+      tgp_size / b_tcols,
+      TB>;
   using mma_t = BlockMMA<
       T,
       U,
@@ -138,8 +160,8 @@ struct GEMMKernel {
 
   /* Main kernel function */
   static METAL_FUNC void run(
-      const device T* A [[buffer(0)]],
-      const device T* B [[buffer(1)]],
+      const device TA* A [[buffer(0)]],
+      const device TB* B [[buffer(1)]],
       device U* D [[buffer(2)]],
       const constant GEMMParams* params [[buffer(3)]],
       threadgroup T* As [[threadgroup(0)]],

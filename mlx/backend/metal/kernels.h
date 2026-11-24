@@ -133,10 +133,42 @@ MTL::ComputePipelineState* get_steel_gemm_fused_kernel(
     int wm,
     int wn);
 
+MTL::ComputePipelineState* get_steel_gemm_fused_mixed_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& a,
+    const array& b,
+    const array& out,
+    bool transpose_a,
+    bool transpose_b,
+    int bm,
+    int bn,
+    int bk,
+    int wm,
+    int wn);
+
 MTL::ComputePipelineState* get_steel_gemm_splitk_kernel(
     metal::Device& d,
     const std::string& kernel_name,
     const array& in,
+    const array& out,
+    bool transpose_a,
+    bool transpose_b,
+    int bm,
+    int bn,
+    int bk,
+    int wm,
+    int wn,
+    bool mn_aligned,
+    bool k_aligned);
+
+MTL::ComputePipelineState* get_steel_gemm_splitk_mixed_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& a,
+    const array& b,
     const array& out,
     bool transpose_a,
     bool transpose_b,
@@ -237,6 +269,22 @@ MTL::ComputePipelineState* get_gemv_kernel(
     bool nc,
     bool axpby);
 
+MTL::ComputePipelineState* get_gemv_mixed_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& mat,
+    const array& vec,
+    const array& out,
+    bool transpose_mat,
+    int bm,
+    int bn,
+    int sm,
+    int sn,
+    int tm,
+    int tn,
+    bool nc,
+    bool axpby);
+
 MTL::ComputePipelineState* get_gemv_gather_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -269,6 +317,17 @@ MTL::ComputePipelineState* get_gemv_wide_kernel(
     const std::string& kernel_name,
     const std::string& hash_name,
     const metal::MTLFCList& func_consts,
+    const array& out,
+    int vecs_per_tg,
+    int k_lanes);
+
+MTL::ComputePipelineState* get_gemv_wide_mixed_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& mat,
+    const array& vec,
     const array& out,
     int vecs_per_tg,
     int k_lanes);
@@ -343,6 +402,23 @@ MTL::ComputePipelineState* get_steel_gemm_fused_nax_kernel(
     int wm,
     int wn);
 
+MTL::ComputePipelineState* get_steel_gemm_fused_nax_mixed_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& a,
+    const array& b,
+    const array& out,
+    bool transpose_a,
+    bool transpose_b,
+    int bm,
+    int bn,
+    int bk,
+    int wm,
+    int wn,
+    bool relaxed);
+
 MTL::ComputePipelineState* get_steel_gemm_gather_nax_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -371,6 +447,22 @@ MTL::ComputePipelineState* get_steel_gemm_splitk_nax_kernel(
     int bk,
     int wm,
     int wn);
+
+MTL::ComputePipelineState* get_steel_gemm_splitk_nax_mixed_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& a,
+    const array& b,
+    bool transpose_a,
+    bool transpose_b,
+    int bm,
+    int bn,
+    int bk,
+    int wm,
+    int wn,
+    bool relaxed);
 
 MTL::ComputePipelineState* get_steel_gemm_segmented_nax_kernel(
     metal::Device& d,
