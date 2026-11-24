@@ -294,9 +294,9 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
 
     @unittest.skipIf(not mx.is_available(mx.gpu), "GPU kernel path only")
     def test_sdpa_full_head_dim_256(self):
-        # On NAX devices, large nearly-square causal blocks take the fused
-        # path; everything else takes the unfused fallback. Ragged lengths
-        # exercise the kernel's unaligned pipelines, and K/V sliced out of a
+        # On NAX devices, 1024+ query rows take the fused path (causal, bool
+        # mask or none); everything else takes the unfused fallback. Ragged
+        # lengths exercise the kernel's unaligned pipelines, and K/V sliced out of a
         # longer preallocated cache (the way mlx-lm hands them over) exercise
         # the dispatch reading the slice past its end. All of it must be
         # correct.
@@ -317,8 +317,19 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             (2049, 2049, "causal", 2304),
             (2048, 2500, "causal", 2560),
             (1031, 2049, "causal", 2304),
+            # fused on NAX: noncausal without a mask (encoders, bidirectional
+            # prefixes), aligned, ragged and rectangular, at the 1024-row
+            # routing boundary and sliced out of a longer cache
+            (1024, 1024, None, None),
+            (2049, 2049, None, None),
+            (1031, 3001, None, None),
+            (2049, 2049, None, 2304),
+            # unfused below 1024 query rows
+            (1023, 1023, None, None),
+            # fused on NAX: bool key-padding mask (batched right-padded rows)
+            (1100, 1100, "keys", None),
         ]
-        for dtype in (mx.float32, mx.bfloat16):
+        for dtype in (mx.float32, mx.float16, mx.bfloat16):
             for qL, kL, mask, cache_len in cases:
                 with self.subTest(
                     dtype=dtype, qL=qL, kL=kL, mask=mask, cache_len=cache_len
@@ -344,6 +355,8 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                         )
                         k = k_cache.astype(dtype)[..., :kL, :]
                         v = v_cache.astype(dtype)[..., :kL, :]
+                    if mask == "keys":
+                        mask = (mx.arange(kL) < kL - 77)[None, None, None, :]
                     k_rep = mx.repeat(k, Nq // Nkv, axis=1)
                     v_rep = mx.repeat(v, Nq // Nkv, axis=1)
                     ref = mlx_primitives_sdpa(q, k_rep, v_rep, scale, mask=mask)
@@ -354,7 +367,7 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                     if dtype == mx.float32:
                         # The fused shapes run through tf32 tensor ops when
                         # MLX_ENABLE_TF32 is on (the default).
-                        tol = 1e-3 if qL >= 2048 else 1e-4
+                        tol = 1e-3 if qL >= 1024 else 1e-4
                     else:
                         tol = 5e-3
                     self.assertTrue(mx.allclose(ref, out, atol=tol, rtol=tol))
@@ -403,6 +416,21 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                 q, k, v_arg, scale=scale, mask=mask_arg, sinks=sinks_arg
             )
             self.assertTrue(mx.allclose(ref, out, atol=1e-3, rtol=1e-3))
+
+        # D=256 noncausal without a mask on the fused path: attention sinks,
+        # and more queries than keys
+        scale = 256**-0.5
+        sinks = mx.random.normal((8,), mx.float16)
+        for qL, kL, sinks_arg in ((1024, 1024, sinks), (1025, 17, None)):
+            with self.subTest(qL=qL, kL=kL, sinks=sinks_arg is not None):
+                q = (0.5 * mx.random.normal((1, 8, qL, 256))).astype(mx.float16)
+                k = (0.5 * mx.random.normal((1, 2, kL, 256))).astype(mx.float16)
+                v = (0.5 * mx.random.normal((1, 2, kL, 256))).astype(mx.float16)
+                ref = mlx_ref_attn(q, k, v, scale=scale, sinks=sinks_arg)
+                out = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=scale, sinks=sinks_arg
+                )
+                self.assertTrue(mx.allclose(ref, out, atol=1e-3, rtol=1e-3))
 
     @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
     def test_sdpa_full_head_dim_512_nax(self):

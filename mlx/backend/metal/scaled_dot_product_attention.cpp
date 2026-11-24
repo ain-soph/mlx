@@ -217,11 +217,11 @@ void sdpa_full_self_attention_nax(
 
   int bd = q.shape(-1);
   int bv = v.shape(-1);
-  int bq = bd == 512 ? 32 : 64;
-  int bk = 32;
-
   bool split_d = (bd == 256 || bd == 512);
-  int wm = bd == 512 ? 2 : 4;
+  // D=256 and D=512: 32-row Q tiles (twice the threadgroups of bq64 at D=256).
+  int bq = split_d ? 32 : 64;
+  int bk = 32;
+  int wm = split_d ? 2 : 4;
   int wn = split_d ? bd / 128 : 1;
   int B = q.shape(0);
   int H = q.shape(1);
@@ -1441,11 +1441,12 @@ bool ScaledDotProductAttention::use_fallback(
   }
 
   // Use headdim-split kernel when NAX is enabled and there are enough query
-  // blocks to fill the machine.
+  // blocks to fill the machine: causal, masked and unmasked noncausal alike
+  // (unmasked noncausal 1K-32K tokens: 5-40% faster than the unfused path,
+  // which also needs L x L scores).
   if (metal::is_nax_available() &&
       (env::enable_tf32() || q.dtype() != float32) &&
-      query_sequence_length >= 1024 && query_head_dim == 256 &&
-      (do_causal || has_arr_mask)) {
+      query_sequence_length >= 1024 && query_head_dim == 256) {
     return false;
   }
 
