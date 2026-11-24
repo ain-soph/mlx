@@ -889,6 +889,36 @@ class TestBlas(mlx_tests.MLXTestCase):
             expected = 0.5 * (a @ b) + 2.0 * c
             self.assertTrue(mx.allclose(out, expected, rtol=tol, atol=tol))
 
+    def test_addmm_vector_output_strided_c(self):
+        # N == 1 uses gemv, and c is a column with a row stride that is not 1
+        rng = np.random.default_rng(0)
+        M, K = 64, 256
+        for t, tol in [(mx.float32, 1e-5), (mx.float16, 1e-3), (mx.bfloat16, 1e-2)]:
+            a = mx.array(rng.normal(0.0, 1.0, (M, K)).astype(np.float32))
+            b = mx.array(rng.normal(0.0, 1.0 / K, (K, 1)).astype(np.float32))
+            c_big = mx.array(rng.normal(0.0, 1.0, (2 * M, 4)).astype(np.float32))
+            a, b, c_big = a.astype(t), b.astype(t), c_big.astype(t)
+            a_np = np.array(a.astype(mx.float32))
+            b_np = np.array(b.astype(mx.float32))
+            cs = (c_big[:M, :1], c_big[::2, 1:2], mx.contiguous(c_big[:M, :1]))
+            for i, c in enumerate(cs):
+                with self.subTest(dtype=t, c=i):
+                    out = mx.addmm(c, a, b, alpha=0.5, beta=2.0)
+                    expected = 0.5 * (a_np @ b_np) + 2.0 * np.array(
+                        c.astype(mx.float32)
+                    )
+                    out = np.array(out.astype(mx.float32))
+                    self.assertTrue(np.allclose(out, expected, rtol=tol, atol=tol))
+
+        # Batched, with a column of a larger c
+        a = mx.array(rng.normal(0.0, 1.0, (3, M, K)).astype(np.float32))
+        b = mx.array(rng.normal(0.0, 1.0 / K, (3, K, 1)).astype(np.float32))
+        c_big = mx.array(rng.normal(0.0, 1.0, (3, M, 3)).astype(np.float32))
+        c = c_big[..., 2:]
+        out = mx.addmm(c, a, b, alpha=0.5, beta=2.0)
+        expected = 0.5 * (np.array(a) @ np.array(b)) + 2.0 * np.array(c)
+        self.assertTrue(np.allclose(out, expected, rtol=1e-5, atol=1e-5))
+
     def test_wide_addmm(self):
         if mx.default_device() == mx.cpu:
             self.skipTest("requires GPU")

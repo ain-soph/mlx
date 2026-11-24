@@ -1346,7 +1346,8 @@ void gemv_axbpy(
 
     compute_encoder.set_vector_bytes(C_batch_stride, 13);
 
-    int bias_stride = c.strides()[c.ndim() - 1];
+    // The bias follows the output vector. If N == 1, that is a column of c.
+    int bias_stride = c.strides()[c.ndim() - (is_b_matrix ? 1 : 2)];
     compute_encoder.set_bytes(bias_stride, 14);
   }
 
