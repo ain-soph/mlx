@@ -1467,9 +1467,26 @@ class TestConvRot(mlx_tests.MLXTestCase):
                     d = np.array(ys.astype(mx.float32)) - ref
                     self.assertLess(np.sqrt(np.mean(d ** 2)) / scale, 5e-3)
                     self.assertTrue(mx.array_equal(ys, mx.fast.convrot_matmul_w8a16(x, q, s, split_k=split)))
-        with self.assertRaises(ValueError):
-            mx.fast.convrot_matmul_w8a16(mx.zeros((4, 256)), mx.zeros((8, 256), dtype=mx.int8), mx.ones((8,)),
-                                         split_k=0)
+        # 128 x 64 tiles above 2048 rows; split_k beyond the number of K blocks
+        x, q, s, y, ref = self.check_w8a16(2049, 64, 512, mx.bfloat16, key=5)
+        y1 = mx.fast.convrot_matmul_w8a16(x, q, s, split_k=1)
+        d = np.array(y1.astype(mx.float32)) - ref
+        self.assertLess(np.sqrt(np.mean(d ** 2)) / np.sqrt(np.mean(ref ** 2)), 5e-3)
+        x, q, s, y, ref = self.check_w8a16(40, 96, 512, mx.float16, key=6)
+        for split in (100, 2**31 - 1):
+            ys = mx.fast.convrot_matmul_w8a16(x, q, s, split_k=split)
+            d = np.array(ys.astype(mx.float32)) - ref
+            self.assertLess(np.sqrt(np.mean(d ** 2)) / np.sqrt(np.mean(ref ** 2)), 5e-3)
+        # compile keeps calls with different split_k apart
+        f = mx.compile(lambda a: (mx.fast.convrot_matmul_w8a16(a, q, s, split_k=1),
+                                  mx.fast.convrot_matmul_w8a16(a, q, s, split_k=3)))
+        c1, c3 = f(x)
+        self.assertTrue(mx.array_equal(c1, mx.fast.convrot_matmul_w8a16(x, q, s, split_k=1)))
+        self.assertTrue(mx.array_equal(c3, mx.fast.convrot_matmul_w8a16(x, q, s, split_k=3)))
+        for bad in (0, -1):
+            with self.assertRaises(ValueError):
+                mx.fast.convrot_matmul_w8a16(mx.zeros((4, 256)), mx.zeros((8, 256), dtype=mx.int8), mx.ones((8,)),
+                                             split_k=bad)
 
     def test_matmul_w8a16_edges(self):
         q = mx.ones((32, 256), dtype=mx.int8)
@@ -1489,6 +1506,15 @@ class TestConvRot(mlx_tests.MLXTestCase):
         self.assertTrue(mx.array_equal(f(x), ref))
         x2 = mx.random.normal((9, 256)).astype(mx.bfloat16)
         self.assertEqual(f(x2).shape, (9, 32))
+        # strided inputs and bfloat16 scales
+        xs = mx.random.normal((10, 256)).astype(mx.bfloat16)
+        qs2 = mx.random.randint(-127, 128, (64, 256)).astype(mx.int8)
+        ss2 = mx.random.uniform(1e-3, 1e-2, (64,))
+        y = mx.fast.convrot_matmul_w8a16(xs[::2], qs2[::2], ss2[::2].astype(mx.bfloat16))
+        yc = mx.fast.convrot_matmul_w8a16(
+            mx.array(np.array(xs[::2].astype(mx.float32))).astype(mx.bfloat16),
+            mx.array(np.array(qs2[::2])), ss2[::2].astype(mx.bfloat16))
+        self.assertTrue(mx.array_equal(y, yc))
         # vmap over a batch of weights uses the fallback
         qs = mx.stack([q, 2 * q])
         ys = mx.vmap(lambda w: mx.fast.convrot_matmul_w8a16(x, w, s, rotated=True))(qs)

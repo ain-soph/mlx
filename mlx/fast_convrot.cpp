@@ -386,7 +386,7 @@ array convrot_matmul_w8a16(
   auto xr = rotated ? x2 : convrot_rotate(x2, s);
   auto out_type = x.dtype();
   auto sc = astype(scales, float32, s);
-  auto fallback = [out_type, s](const std::vector<array>& in) {
+  auto fallback = [out_type, s = to_stream(s)](const std::vector<array>& in) {
     auto acc = matmul(
         astype(in[0], float32, s),
         swapaxes(astype(in[1], float32, s), -1, -2, s),

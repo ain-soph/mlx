@@ -56,7 +56,7 @@ bool config_from_env(ConvRotConfig& c) {
   }
   bool bad = c.partitions < 1 || c.swizzle < -1 || c.swizzle > 4;
   for (int i = 0; i < 5; i++) {
-    bad |= c.t[i] < 1;
+    bad |= c.t[i] < 1 || c.t[i] > 1024;
   }
   if (bad) {
     throw std::invalid_argument("[convrot_matmul_w8a16] bad MLX_CONVROT_W8A16");
@@ -144,24 +144,33 @@ void ConvRotW8A16::eval_gpu(
   auto& out = outputs[0];
 
   const int M = x.shape(0), K = x.shape(1), N = w.shape(0);
-  out.set_data(allocator::malloc(out.nbytes()));
   if (M == 0 || N == 0) {
+    out.set_data(allocator::malloc(0));
     return;
   }
   if (K == 0) {
-    fill_gpu(array(0, out.dtype()), out, s);
+    array zero(0, out.dtype());
+    fill_gpu(zero, out, s);
+    metal::get_command_encoder(s).add_temporary(std::move(zero));
     return;
   }
+  out.set_data(allocator::malloc(out.nbytes()));
 
   auto c = choose_config(M, N, K, d.get_architecture().back(), split_k_);
   // The partition stride is an int in the kernel parameters.
   if (size_t(M) * size_t(N) > size_t(INT_MAX)) {
     c.partitions = 1;
   }
-  const int align = c.thin ? 64 * c.t[4] : c.t[2];
-  int partition = (K + c.partitions - 1) / c.partitions;
-  partition = (partition + align - 1) / align * align;
-  const int partitions = (K + partition - 1) / partition;
+  // Partitions are whole K blocks (64 KS for thin, BK for tiled); at most one
+  // per block, computed in 64 bits (split_k and the environment are unbounded).
+  const int64_t align = c.thin ? int64_t(64) * c.t[4] : int64_t(c.t[2]);
+  const int64_t blocks = std::max<int64_t>(1, (int64_t(K) + align - 1) / align);
+  const int64_t asked = std::min<int64_t>(c.partitions, blocks);
+  int64_t partition64 = (int64_t(K) + asked - 1) / asked;
+  partition64 = std::min<int64_t>(
+      (partition64 + align - 1) / align * align, std::max<int64_t>(K, align));
+  const int partition = int(partition64);
+  const int partitions = int((int64_t(K) + partition64 - 1) / partition64);
   const bool partial = partitions > 1;
 
   array acc = out;
@@ -243,7 +252,7 @@ void ConvRotW8A16::eval_gpu(
     enc.set_output_array(acc, 3);
     enc.set_bytes(params, 4);
     enc.dispatch_threadgroups(
-        MTL::Size(tn_swizzled * tm_swizzled * partitions, 1, 1),
+        MTL::Size(size_t(tn_swizzled) * tm_swizzled * partitions, 1, 1),
         MTL::Size(32, wn, wm));
   }
 

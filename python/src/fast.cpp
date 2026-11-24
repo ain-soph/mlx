@@ -225,7 +225,7 @@ void init_fast(nb::module_& parent_module) {
       "split_k"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def convrot_matmul_w8a16(x: array, w: array, scales: array, *, rotated: bool = False, split_k: Optional[int] = None, stream: StreamOrDevice = None) -> array"),
+          "def convrot_matmul_w8a16(x: array, w: array, scales: array, *, rotated: bool = False, split_k: int | None = None, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         ``x @ W.T`` for a ConvRot ``int8`` weight with ``float32`` row scales,
         keeping the activations in floating point (W8A16): more accurate than

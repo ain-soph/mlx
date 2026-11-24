@@ -59,7 +59,6 @@ template <
   const int c_row = tid_y * BM;
   const int c_col = tid_x * BN;
   const int k_start = params->split_k_partition_size * tid_z;
-  const int k_end = min(k_start + params->split_k_partition_size, params->K);
 
   // A [M, K] row-major, B [N, K] row-major (transposed operand)
   A += size_t(c_row) * params->lda + size_t(k_start);
@@ -98,7 +97,8 @@ template <
 
   NAXTile<float, TM, TN> Dtile;
 
-  const int partition_k_size = k_end - k_start;
+  const int partition_k_size =
+      min(params->split_k_partition_size, params->K - k_start);
   const int partition_k_iters = partition_k_size / BK;
   const bool partition_k_aligned = (partition_k_size % BK) == 0;
 
