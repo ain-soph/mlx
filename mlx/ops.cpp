@@ -37,6 +37,11 @@ bool can_mixed_float_matmul(
   if (!is_supported(a) || !is_supported(b)) {
     return false;
   }
+  // The mixed kernels are built at run time. If that is disabled, cast the
+  // inputs.
+  if (!config::get("MLX_METAL_RUNTIME_COMPILE", 1)) {
+    return false;
+  }
   auto stream = to_stream(s);
   return stream.device == Device::gpu && metal::is_available() &&
       metal::is_nax_available();

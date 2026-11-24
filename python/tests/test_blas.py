@@ -1244,6 +1244,48 @@ class TestBlas(mlx_tests.MLXTestCase):
             np.allclose(out, 0.5 * (a_np @ b_np) + 2.0 * np.array(c), 1e-4, 1e-4)
         )
 
+    def test_mixed_float_matmul_no_runtime_compile(self):
+        # With runtime compilation disabled, mixed inputs are cast to float32
+        # first, so the result is the same as with explicit casts.
+        np.random.seed(5)
+        # Routes that the mixed path takes
+        cases = (
+            (1, 512, 128, False),  # gemv_t
+            (1, 512, 128, True),  # gemv
+            (4, 512, 512, True),  # gemv_wide
+            (256, 512, 512, True),  # GEMM
+        )
+        for (M, K, N, trans_b), (ta, tb) in itertools.product(
+            cases, self.MIXED_FLOAT_PAIRS
+        ):
+            with self.subTest(shape=(M, K, N), ta=ta, tb=tb):
+                a, b, _, _ = self.__mixed_inputs(
+                    (M, K), (N, K) if trans_b else (K, N), ta, tb
+                )
+                if trans_b:
+                    b = b.T
+                c = mx.array(np.random.normal(0.0, 1.0, (N,)).astype(np.float32))
+                # This also loads the kernels that the cast path uses.
+                a32, b32 = a.astype(mx.float32), b.astype(mx.float32)
+                ref = a32 @ b32
+                ref_add = mx.addmm(c, a32, b32, alpha=0.5, beta=2.0)
+                mx.eval(ref, ref_add)
+                # Made before runtime compilation is disabled
+                early = a @ b
+                early_add = mx.addmm(c, a, b, alpha=0.5, beta=2.0)
+                with mx.config.scoped_update(MLX_METAL_RUNTIME_COMPILE=0):
+                    out = a @ b
+                    out_add = mx.addmm(c, a, b, alpha=0.5, beta=2.0)
+                    mx.eval(out, out_add, early, early_add)
+                for x, expected in (
+                    (out, ref),
+                    (early, ref),
+                    (out_add, ref_add),
+                    (early_add, ref_add),
+                ):
+                    self.assertEqual(x.dtype, mx.float32)
+                    self.assertTrue(mx.array_equal(x, expected))
+
     def test_mixed_float_matmul_grad(self):
         np.random.seed(3)
         f32 = mx.float32

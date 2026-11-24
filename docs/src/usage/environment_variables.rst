@@ -119,7 +119,8 @@ Metal
    Allow building Metal libraries from source at runtime. The default is
    ``1``. Set it to ``0`` to throw instead when a kernel needs a library that
    has not been loaded yet. Libraries loaded earlier, including ones loaded by
-   name from a ``.metallib``, are still used.
+   name from a ``.metallib``, are still used. Matrix products of different
+   float types then cast their inputs to the output type first.
 
 .. envvar:: MLX_CONV_WINOGRAD
 

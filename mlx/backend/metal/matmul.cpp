@@ -129,8 +129,8 @@ bool is_supported_mixed_float(Dtype d) {
   return d == float32 || d == bfloat16 || d == float16;
 }
 
-// If this returns false, the caller casts the narrow input to the output
-// type. That is the same AsType copy that main does, so main kernels run.
+// If this returns false, the caller casts the inputs to the output type, as
+// ops.cpp does.
 bool can_use_mixed_metal(
     const array& a_pre,
     const array& b_pre,
@@ -140,6 +140,10 @@ bool can_use_mixed_metal(
     int N) {
   if (!metal::is_nax_available() || out.dtype() != float32 ||
       a_pre.dtype() == b_pre.dtype()) {
+    return false;
+  }
+  // A graph built while runtime compilation was enabled can get here.
+  if (!config::get("MLX_METAL_RUNTIME_COMPILE", 1)) {
     return false;
   }
   if (!is_supported_mixed_float(a_pre.dtype()) ||
