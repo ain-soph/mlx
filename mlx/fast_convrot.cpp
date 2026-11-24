@@ -9,6 +9,7 @@
 
 #include "mlx/backend/metal/metal.h"
 #include "mlx/fast.h"
+#include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
 #include "mlx/utils.h"
 
@@ -56,6 +57,25 @@ constexpr const char* kRotateQuantize = R"(
     device int8_t* qr = xq + (size_t)row * K;
     for (uint g = 0; g < groups; ++g) qr[g * 256 + t] = int8_t(clamp(rint(v[g] / scale), -127.0f, 127.0f));
     if (t == 0) xs[row] = scale;
+)";
+
+// One threadgroup per (256-wide group, row): the butterfly of
+// kRotateQuantize, written back in x's type (one rounding).
+constexpr const char* kRotate = R"(
+    const uint t = thread_position_in_threadgroup.x;
+    const uint row = threadgroup_position_in_grid.y;
+    const uint g = threadgroup_position_in_grid.x;
+    const uint K = x_shape[1];
+    threadgroup float buf[256];
+    float a = float(x[(size_t)row * K + g * 256 + t]);
+    for (uint s = 1; s < 256; s *= 4) {
+        buf[t] = a;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint k = (t / s) % 4, base = t - k * s;
+        a = buf[base] + buf[base + s] + buf[base + 2 * s] + buf[base + 3 * s] - 2.0f * buf[base + (3 - k) * s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    xr[(size_t)row * K + g * 256 + t] = T(a * 0.0625f);
 )";
 
 constexpr const char* kGemmHeader = R"(
@@ -164,6 +184,14 @@ std::pair<array, array> quantize_reference(const array& x, StreamOrDevice s) {
       int8,
       s);
   return {q, scale};
+}
+
+/** Reference rotation: rows of x [M, K] times H in float32, in x's type. */
+array rotate_reference(const array& x, StreamOrDevice s) {
+  int m = x.shape(0), k = x.shape(1);
+  auto r = matmul(
+      reshape(astype(x, float32, s), {-1, kGroup}, s), hadamard256(), s);
+  return astype(reshape(r, {m, k}, s), x.dtype(), s);
 }
 
 bool use_kernels(StreamOrDevice s) {
@@ -289,6 +317,93 @@ array convrot_matmul(
   auto [xq, xs] = convrot_quantize(x2, s);
   auto y = convrot_matmul_quantized(xq, xs, w, scales, x.dtype(), std::nullopt, s);
   shape.back() = w.shape(0);
+  return reshape(y, shape, s);
+}
+
+array convrot_rotate(const array& x, StreamOrDevice s) {
+  if (x.ndim() < 1 || !issubdtype(x.dtype(), floating)) {
+    throw std::invalid_argument(
+        "[convrot_rotate] x must be a floating point array.");
+  }
+  check_k("convrot_rotate", x.shape(-1));
+  auto shape = x.shape();
+  int k = shape.back();
+  if (x.size() == 0) {
+    return x;
+  }
+  auto x2 = reshape(x, {-1, k}, s);
+  int m = x2.shape(0);
+  auto stream = to_stream(s);
+  array y = (stream.device == Device::gpu && metal::is_available())
+      ? [&] {
+          static auto kernel =
+              metal_kernel("convrot_rotate", {"x"}, {"xr"}, kRotate);
+          return kernel(
+              {x2},
+              {{m, k}},
+              {x.dtype()},
+              {k, m, 1},
+              {kGroup, 1, 1},
+              {{"T", x.dtype()}},
+              std::nullopt,
+              false,
+              s)[0];
+        }()
+      : rotate_reference(x2, s);
+  return reshape(y, shape, s);
+}
+
+array convrot_matmul_w8a16(
+    const array& x,
+    const array& w,
+    const array& scales,
+    bool rotated,
+    std::optional<int> split_k,
+    StreamOrDevice s) {
+  if (x.ndim() < 1 || !issubdtype(x.dtype(), floating)) {
+    throw std::invalid_argument(
+        "[convrot_matmul_w8a16] x must be a floating point array.");
+  }
+  if (split_k && *split_k < 1) {
+    throw std::invalid_argument(
+        "[convrot_matmul_w8a16] split_k must be at least 1.");
+  }
+  if (w.dtype() != int8 || w.ndim() != 2 || scales.ndim() != 1 ||
+      !issubdtype(scales.dtype(), floating) ||
+      scales.shape(0) != w.shape(0) || x.shape(-1) != w.shape(1)) {
+    throw std::invalid_argument(
+        "[convrot_matmul_w8a16] Expected int8 w [N, K], scales [N] and "
+        "x [..., K] with floating point scales.");
+  }
+  check_k("convrot_matmul_w8a16", w.shape(1));
+  auto shape = x.shape();
+  int k = shape.back(), n = w.shape(0);
+  if (k == 0) {
+    shape.back() = n;
+    return zeros(shape, x.dtype(), s);
+  }
+  auto x2 = reshape(x, {-1, k}, s);
+  auto xr = rotated ? x2 : convrot_rotate(x2, s);
+  auto out_type = x.dtype();
+  auto sc = astype(scales, float32, s);
+  auto fallback = [out_type, s](const std::vector<array>& in) {
+    auto acc = matmul(
+        astype(in[0], float32, s),
+        swapaxes(astype(in[1], float32, s), -1, -2, s),
+        s);
+    return std::vector<array>{
+        astype(multiply(acc, expand_dims(in[2], -2, s), s), out_type, s)};
+  };
+  array y = (use_kernels(s) && n >= 16 &&
+             (out_type == float16 || out_type == bfloat16))
+      ? array(
+            {x2.shape(0), n},
+            out_type,
+            std::make_shared<ConvRotW8A16>(
+                to_stream(s), fallback, split_k.value_or(0)),
+            {xr, w, sc})
+      : fallback({xr, w, sc})[0];
+  shape.back() = n;
   return reshape(y, shape, s);
 }
 

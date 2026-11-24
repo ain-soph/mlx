@@ -393,6 +393,12 @@ MTL::ComputePipelineState* get_steel_gemm_thin_nax_kernel(
     const metal::MTLFCList& func_consts,
     const std::string& template_def);
 
+// ConvRot W8A16 GEMM kernels (steel_gemm_convrot_nax).
+MTL::ComputePipelineState* get_steel_gemm_convrot_nax_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& template_def);
+
 MTL::ComputePipelineState* get_qmm_nax_kernel(
     metal::Device& d,
     const std::string& kernel_name,

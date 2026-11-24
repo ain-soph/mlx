@@ -202,6 +202,55 @@ void init_fast(nb::module_& parent_module) {
         every tiling; BM at most 128 and dividing the rows of ``xq``).
       )pbdoc");
   m.def(
+      "convrot_rotate",
+      &mx::fast::convrot_rotate,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def convrot_rotate(x: array, *, stream: StreamOrDevice = None) -> array"),
+      R"pbdoc(
+        ``x @ H`` with the ConvRot block-diagonal Hadamard-256 rotation, in the
+        type of ``x`` (``K`` a multiple of 256): the activation rotation of
+        :func:`convrot_matmul_w8a16` without quantization.
+      )pbdoc");
+  m.def(
+      "convrot_matmul_w8a16",
+      &mx::fast::convrot_matmul_w8a16,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      nb::kw_only(),
+      "rotated"_a = false,
+      "split_k"_a = nb::none(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def convrot_matmul_w8a16(x: array, w: array, scales: array, *, rotated: bool = False, split_k: Optional[int] = None, stream: StreamOrDevice = None) -> array"),
+      R"pbdoc(
+        ``x @ W.T`` for a ConvRot ``int8`` weight with ``float32`` row scales,
+        keeping the activations in floating point (W8A16): more accurate than
+        :func:`convrot_matmul`, which also quantizes the activations to int8.
+
+        On a GPU with TensorOps (Apple M5 and later, macOS 26.2+) and
+        ``float16`` / ``bfloat16`` activations, the ``int8`` weight rows feed
+        the NAX GEMM directly (no dequantized copy); elsewhere the product is
+        computed in ``float32``.
+
+        Args:
+            x (array): Activations ``[..., K]``.
+            w (array): ``int8`` weight ``[N, K]`` (rotated rows).
+            scales (array): ``float32`` row scales ``[N]``.
+            rotated (bool): ``x`` is already rotated (:func:`convrot_rotate`).
+            split_k (int, optional): K partitions over the GPU grid (float32
+              partial sums added in a fixed order). ``None`` picks them by
+              shape (fastest); ``1`` keeps one pass over ``K``, so the float
+              sums run in ``K`` order (the same bytes as a sequential-K
+              TensorOps GEMM).
+
+        Returns:
+            array: ``[..., N]`` in the type of ``x``.
+      )pbdoc");
+  m.def(
       "rms_norm",
       &mx::fast::rms_norm,
       "x"_a,

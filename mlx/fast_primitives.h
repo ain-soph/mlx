@@ -396,6 +396,39 @@ class ConvertFP8 : public Primitive {
   bool to_fp8_;
 };
 
+// ConvRot W8A16 matmul: inputs (rotated x [M, K] half/bfloat, int8 w [N, K],
+// float32 scales [N]), output [M, N] in x's type. Built only on NAX GPUs.
+class ConvRotW8A16 : public Custom {
+ public:
+  ConvRotW8A16(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int split_k)
+      : Custom(stream, std::move(fallback)), split_k_(split_k) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("[ConvRotW8A16] NYI on the CPU.");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(ConvRotW8A16);
+  bool is_equivalent(const Primitive& other) const override {
+    return split_k_ == static_cast<const ConvRotW8A16&>(other).split_k_;
+  }
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {{inputs[0].shape(0), inputs[1].shape(0)}};
+  }
+  auto state() const {
+    return std::make_pair(nullptr, split_k_);
+  }
+
+ private:
+  int split_k_; // K partitions, 0 = by shape
+};
+
 class GatedDeltaUpdate : public Custom {
  public:
   GatedDeltaUpdate(

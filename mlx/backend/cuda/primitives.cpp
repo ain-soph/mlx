@@ -51,6 +51,7 @@ NO_GPU_MULTI(Eig)
 NO_GPU_MULTI(Eigh)
 
 namespace fast {
+NO_GPU_MULTI(ConvRotW8A16)
 NO_GPU_MULTI(GatedDeltaUpdate)
 NO_GPU_MULTI(GatedDeltaUpdateVJP)
 } // namespace fast

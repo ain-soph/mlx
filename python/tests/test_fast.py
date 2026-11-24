@@ -1368,11 +1368,131 @@ class TestConvRot(mlx_tests.MLXTestCase):
                     yt = mx.fast.convrot_matmul_quantized(xq, xs, q, s, dtype, tiles=tiles)
                     self.assertTrue(mx.array_equal(yt, y), tiles)
 
+    def test_rotate(self):
+        for m, k, dtype in [(1, 256, mx.float32), (37, 768, mx.bfloat16), (5, 25600, mx.float16)]:
+            with self.subTest(m=m, k=k, dtype=dtype):
+                x = mx.random.normal((m, k), key=mx.random.key(k)).astype(dtype)
+                r = mx.fast.convrot_rotate(x)
+                self.assertEqual(r.dtype, dtype)
+                ref = (np.array(x.astype(mx.float32)).reshape(-1, 256) @ self.hadamard()).reshape(m, k)
+                tol = 1e-5 if dtype == mx.float32 else 1e-2
+                self.assertTrue(np.allclose(np.array(r.astype(mx.float32)), ref, rtol=tol, atol=tol))
+                r3 = mx.fast.convrot_rotate(x.reshape(1, m, k))
+                self.assertTrue(mx.array_equal(r3.reshape(m, k), r))
+
+    def check_w8a16(self, m, n, k, dtype, key=0):
+        x = mx.random.normal((m, k), key=mx.random.key(key)).astype(dtype)
+        q = mx.random.randint(-127, 128, (n, k), key=mx.random.key(key + 1)).astype(mx.int8)
+        s = mx.random.uniform(1e-4, 1e-3, (n,), key=mx.random.key(key + 2))
+        xr = mx.fast.convrot_rotate(x)
+        ref = np.array(xr.astype(mx.float32)).astype(np.float64) @ (
+            np.array(q).astype(np.float64) * np.array(s)[:, None]).T
+        y = mx.fast.convrot_matmul_w8a16(x, q, s)
+        self.assertEqual(y.shape, (m, n))
+        self.assertEqual(y.dtype, dtype)
+        d = np.array(y.astype(mx.float32)) - ref
+        scale = np.sqrt(np.mean(ref ** 2))
+        self.assertLess(np.sqrt(np.mean(d ** 2)) / scale, 5e-3)
+        self.assertLess(np.abs(d).max() / np.abs(ref).max(), 1e-2)
+        # same result from the rotated input and with leading dimensions
+        self.assertTrue(mx.array_equal(mx.fast.convrot_matmul_w8a16(xr, q, s, rotated=True), y))
+        y3 = mx.fast.convrot_matmul_w8a16(x.reshape(1, m, k), q, s)
+        self.assertTrue(mx.array_equal(y3.reshape(m, n), y))
+        return x, q, s, y, ref
+
+    def test_matmul_w8a16(self):
+        for m, n, k, dtype in [
+            (1, 16, 256, mx.bfloat16),
+            (7, 96, 768, mx.float16),
+            (31, 1000, 512, mx.bfloat16),   # column tail
+            (32, 512, 8192, mx.bfloat16),   # K split over the grid
+            (33, 200, 512, mx.float16),
+            (64, 5120, 2048, mx.bfloat16),
+            (65, 300, 768, mx.bfloat16),    # tiled kernel, partial tiles
+            (176, 1024, 8192, mx.float16),  # tiled kernel, K split
+            (513, 640, 512, mx.bfloat16),
+            (2049, 256, 1024, mx.bfloat16),
+            (5, 64, 512, mx.float32),       # float32: float product
+        ]:
+            with self.subTest(m=m, n=n, k=k, dtype=dtype):
+                self.check_w8a16(m, n, k, dtype, key=m + n)
+
+    def test_matmul_w8a16_kernels(self):
+        # Every kernel shape, K split and swizzle (MLX_CONVROT_W8A16) agrees with the reference
+        import os
+
+        configs = [
+            "thin,2,2,1,1,4,1", "thin,2,2,1,1,2,3", "thin,2,2,1,2,2,2", "thin,2,4,1,1,2,4",
+            "nax,64,64,256,2,2,1", "nax,64,64,512,2,2,3", "nax,128,64,256,4,2,2",
+            "nax,128,64,512,4,2,1", "nax,64,128,512,2,4,2", "nax,128,128,512,4,4,1",
+            "nax,64,64,256,2,2,2,1", "nax,128,64,512,4,2,3,2",  # with swizzle
+        ]
+        try:
+            for m, n in [(17, 136), (200, 1000)]:
+                for c in configs:
+                    with self.subTest(m=m, n=n, config=c):
+                        os.environ["MLX_CONVROT_W8A16"] = c
+                        _, _, _, y, _ = self.check_w8a16(m, n, 1536, mx.bfloat16, key=m)
+                        # deterministic
+                        os.environ["MLX_CONVROT_W8A16"] = c
+                        _, _, _, y2, _ = self.check_w8a16(m, n, 1536, mx.bfloat16, key=m)
+                        self.assertTrue(mx.array_equal(y, y2))
+        finally:
+            os.environ.pop("MLX_CONVROT_W8A16", None)
+
     def test_errors(self):
         with self.assertRaises(ValueError):
             mx.fast.convrot_quantize(mx.zeros((4, 100)))
         with self.assertRaises(ValueError):
+            mx.fast.convrot_rotate(mx.zeros((4, 100)))
+        with self.assertRaises(ValueError):
+            mx.fast.convrot_matmul_w8a16(mx.zeros((4, 256)), mx.zeros((8, 256)), mx.ones((8,)))
+        with self.assertRaises(ValueError):
+            mx.fast.convrot_matmul_w8a16(
+                mx.zeros((4, 512)), mx.zeros((8, 256), dtype=mx.int8), mx.ones((8,)))
+        with self.assertRaises(ValueError):
+            mx.fast.convrot_matmul_w8a16(
+                mx.zeros((4, 256)), mx.zeros((8, 256), dtype=mx.int8), mx.ones((8,), dtype=mx.int32))
+        with self.assertRaises(ValueError):
             mx.fast.convrot_matmul(mx.zeros((4, 256)), mx.zeros((8, 256)), mx.ones((8,)))
+
+    def test_matmul_w8a16_split_k(self):
+        # split_k=1: one pass over K (tiled kernel for every M); n > 1: n partitions
+        for m, n, k in [(17, 136, 1536), (200, 1000, 4096)]:
+            with self.subTest(m=m, n=n, k=k):
+                x, q, s, y, ref = self.check_w8a16(m, n, k, mx.bfloat16, key=m)
+                scale = np.sqrt(np.mean(ref ** 2))
+                for split in (1, 2, 3):
+                    ys = mx.fast.convrot_matmul_w8a16(x, q, s, split_k=split)
+                    d = np.array(ys.astype(mx.float32)) - ref
+                    self.assertLess(np.sqrt(np.mean(d ** 2)) / scale, 5e-3)
+                    self.assertTrue(mx.array_equal(ys, mx.fast.convrot_matmul_w8a16(x, q, s, split_k=split)))
+        with self.assertRaises(ValueError):
+            mx.fast.convrot_matmul_w8a16(mx.zeros((4, 256)), mx.zeros((8, 256), dtype=mx.int8), mx.ones((8,)),
+                                         split_k=0)
+
+    def test_matmul_w8a16_edges(self):
+        q = mx.ones((32, 256), dtype=mx.int8)
+        s = mx.ones((32,))
+        # no rows, no K
+        y = mx.fast.convrot_matmul_w8a16(mx.zeros((0, 256), dtype=mx.bfloat16), q, s)
+        self.assertEqual(y.shape, (0, 32))
+        y = mx.fast.convrot_matmul_w8a16(
+            mx.zeros((3, 0), dtype=mx.bfloat16), mx.zeros((32, 0), dtype=mx.int8), s)
+        self.assertEqual(y.shape, (3, 32))
+        self.assertTrue(mx.array_equal(y, mx.zeros((3, 32))))
+        self.assertEqual(mx.fast.convrot_rotate(mx.zeros((0, 256))).shape, (0, 256))
+        # shapeless compile: the output is [M, N], not x's shape
+        x = mx.random.normal((5, 256)).astype(mx.bfloat16)
+        f = mx.compile(lambda a: mx.fast.convrot_matmul_w8a16(a, q, s, rotated=True), shapeless=True)
+        ref = mx.fast.convrot_matmul_w8a16(x, q, s, rotated=True)
+        self.assertTrue(mx.array_equal(f(x), ref))
+        x2 = mx.random.normal((9, 256)).astype(mx.bfloat16)
+        self.assertEqual(f(x2).shape, (9, 32))
+        # vmap over a batch of weights uses the fallback
+        qs = mx.stack([q, 2 * q])
+        ys = mx.vmap(lambda w: mx.fast.convrot_matmul_w8a16(x, w, s, rotated=True))(qs)
+        self.assertEqual(ys.shape, (2, 5, 32))
 
 
 if __name__ == "__main__":

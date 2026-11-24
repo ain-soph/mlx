@@ -11,6 +11,8 @@ using namespace metal;
 
 namespace mlx::steel {
 
+// B may have a narrower element type TB than T (int8 ConvRot weights): the
+// tile loads convert each element to T in registers.
 template <
     typename T,
     short SM,
@@ -22,10 +24,11 @@ template <
     bool kAlignedM,
     bool kAlignedN,
     bool kAlignedK,
-    typename AccumType = float>
+    typename AccumType = float,
+    typename TB = T>
 auto gemm_loop(
     const device T* A,
-    const device T* B,
+    const device TB* B,
     int lda,
     int ldb,
     int K,

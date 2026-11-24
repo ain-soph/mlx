@@ -172,4 +172,32 @@ MLX_API array convrot_matmul_quantized(
     std::optional<std::tuple<int, int, int>> tiles = std::nullopt,
     StreamOrDevice s = {});
 
+/**
+ * x H for x [..., K] (K a multiple of 256) in x's type: the ConvRot activation
+ * rotation without quantization. On the GPU the rotation runs in float32 and
+ * rounds once to x's type.
+ */
+MLX_API array convrot_rotate(const array& x, StreamOrDevice s = {});
+
+/**
+ * ConvRot W8A16: y = (x H) W^T for a ConvRot int8 weight w [N, K] with float32
+ * scales [N], keeping the activations in x's floating point type (no int8
+ * activation quantization; more accurate than convrot_matmul). x [..., K],
+ * y [..., N] in x's type. rotated = true means x is already x H (from
+ * convrot_rotate), e.g. to share one rotation between several weights.
+ * On NAX GPUs (M5) with half / bfloat x the int8 weight rows go straight into
+ * the NAX GEMM (converted in registers, no dequantized copy); elsewhere the
+ * product is computed in float32. split_k: K partitions over the GPU grid
+ * (float32 partial sums added in a fixed order); nullopt picks them by shape,
+ * 1 keeps one pass over K (the float sums run in K order: the same bytes as a
+ * sequential-K TensorOps GEMM).
+ */
+MLX_API array convrot_matmul_w8a16(
+    const array& x,
+    const array& w,
+    const array& scales,
+    bool rotated = false,
+    std::optional<int> split_k = std::nullopt,
+    StreamOrDevice s = {});
+
 } // namespace mlx::core::fast

@@ -98,6 +98,7 @@ if(MLX_METAL_JIT)
     make_jit_source(steel/gemm/kernels/steel_gemm_splitk_nax)
     make_jit_source(steel/gemm/kernels/steel_gemm_segmented_nax)
     make_jit_source(steel/gemm/kernels/steel_gemm_thin_nax)
+    make_jit_source(steel/gemm/kernels/steel_gemm_convrot_nax)
 
     make_jit_source(quantized_nax kernels/quantized_utils.h)
     make_jit_source(fp_quantized_nax kernels/quantized_utils.h kernels/fp8.h
@@ -127,6 +128,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/device_info.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/compiled.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/conv.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/convrot.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/copy.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/custom_kernel.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/distributed.cpp
